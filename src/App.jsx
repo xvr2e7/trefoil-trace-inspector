@@ -1,22 +1,40 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
-import { parseHandCsv, worldToLocal3D, loadReference, participantFromFilename } from './csv.js'
+import {
+  parseHandCsv, handLocal3D, participantFromFilename,
+  parseTrackerCsv, trackerLocal3D, sessionFromFilename,
+  loadReference,
+} from './csv.js'
 import { Viewer, REP_COLORS, ALL_COLORS } from './viewer.js'
 
 const BASE_URL = import.meta.env.BASE_URL
+const MIN_TRACKER_POINTS = 10
 
 function hex(c) {
   return '#' + c.toString(16).padStart(6, '0')
+}
+
+// Classify a dropped filename. Falls back to 'hand' (the historical default).
+function datasetFromFilename(name) {
+  if (/^RotatingTrace_/i.test(name)) return 'tracker'
+  if (/_Hand\.csv$/i.test(name)) return 'hand'
+  return null
 }
 
 export default function App() {
   const plotRef = useRef(null)
   const viewerRef = useRef(null)
 
-  // Map of participant id → trial array (with .local3D precomputed).
-  const [bundles, setBundles] = useState({})
-  const [participant, setParticipant] = useState(null)
-  const [mode, setMode] = useState('single')
+  const [dataset, setDataset] = useState('hand') // 'hand' | 'tracker'
+
+  // Per-dataset bundles + active key, kept separate so switching the toggle
+  // doesn't lose either side's loaded data.
+  const [handBundles, setHandBundles] = useState({})
+  const [trackerBundles, setTrackerBundles] = useState({})
+  const [handKey, setHandKey] = useState(null)
+  const [trackerKey, setTrackerKey] = useState(null)
+
+  const [mode, setMode] = useState('single') // 'single' | 'condition' (hand only) | 'all'
   const [singleIdx, setSingleIdx] = useState(0)
   const [condIdx, setCondIdx] = useState(0)
   const [showRef, setShowRef] = useState(true)
@@ -24,13 +42,17 @@ export default function App() {
   const [parseErr, setParseErr] = useState(null)
   const [hover, setHover] = useState(null)
 
-  const trials = participant ? bundles[participant] ?? [] : []
+  const bundles = dataset === 'hand' ? handBundles : trackerBundles
+  const activeKey = dataset === 'hand' ? handKey : trackerKey
+  const trials = activeKey ? bundles[activeKey] ?? [] : []
+
   const byCondition = useMemo(() => {
+    if (dataset !== 'hand') return {}
     const m = {}
     for (const t of trials) (m[t.ConfigurationId] ??= []).push(t)
     for (const k of Object.keys(m)) m[k].sort((a, b) => a.RepetitionNumber - b.RepetitionNumber)
     return m
-  }, [trials])
+  }, [trials, dataset])
   const condIds = Object.keys(byCondition).map(Number).sort((a, b) => a - b)
 
   // Boot the Three.js viewer once the container is mounted.
@@ -49,6 +71,11 @@ export default function App() {
     }
   }, [])
 
+  // If we switch to a dataset that doesn't support the current mode, fall back.
+  useEffect(() => {
+    if (dataset === 'tracker' && mode === 'condition') setMode('single')
+  }, [dataset, mode])
+
   // Re-render scene whenever the chosen view changes.
   useEffect(() => {
     const v = viewerRef.current
@@ -63,7 +90,8 @@ export default function App() {
         if (!t) return
         if (showRef) v.addReference(await loadReference(t.R2, BASE_URL))
         if (cancelled) return
-        v.addTrace(t.local3D, REP_COLORS[t.RepetitionNumber] ?? ALL_COLORS[0], {
+        const repIdx = dataset === 'hand' ? t.RepetitionNumber : t.TrialIndex
+        v.addTrace(t.local3D, REP_COLORS[repIdx % REP_COLORS.length] ?? ALL_COLORS[0], {
           showDots: true,
           alpha: 1.0,
         })
@@ -99,12 +127,12 @@ export default function App() {
     return () => {
       cancelled = true
     }
-  }, [trials, byCondition, mode, singleIdx, condIdx, showRef])
+  }, [trials, byCondition, mode, singleIdx, condIdx, showRef, dataset])
 
-  // Resize plot when the layout might have changed (e.g. participant added).
+  // Resize plot when the layout might have changed.
   useEffect(() => {
     viewerRef.current?.resize()
-  }, [bundles, participant])
+  }, [handBundles, trackerBundles, dataset, handKey, trackerKey])
 
   const ingestFiles = useCallback(async (files) => {
     setParseErr(null)
@@ -113,34 +141,54 @@ export default function App() {
       setParseErr('No .csv files in drop')
       return
     }
-    const next = { ...bundles }
-    let firstNew = null
+    const nextHand = { ...handBundles }
+    const nextTracker = { ...trackerBundles }
+    let firstNewHand = null
+    let firstNewTracker = null
     const errors = []
     for (const f of csvFiles) {
+      const kind = datasetFromFilename(f.name) ?? dataset
       try {
         const text = await f.text()
-        const rows = parseHandCsv(text)
-        if (!rows.length) {
-          errors.push(`${f.name}: 0 rows parsed`)
-          continue
+        if (kind === 'tracker') {
+          const rows = parseTrackerCsv(text).filter((t) => t.world.length >= MIN_TRACKER_POINTS)
+          if (!rows.length) {
+            errors.push(`${f.name}: 0 trials with ≥${MIN_TRACKER_POINTS} points`)
+            continue
+          }
+          for (const t of rows) t.local3D = trackerLocal3D(t.world, t.angles)
+          const id = sessionFromFilename(f.name)
+          nextTracker[id] = rows
+          firstNewTracker ??= id
+        } else {
+          const rows = parseHandCsv(text)
+          if (!rows.length) {
+            errors.push(`${f.name}: 0 rows parsed`)
+            continue
+          }
+          for (const t of rows) t.local3D = handLocal3D(t.world, t.FreezeAngle, t.Handedness)
+          const id = participantFromFilename(f.name)
+          nextHand[id] = rows
+          firstNewHand ??= id
         }
-        for (const t of rows) {
-          t.local3D = worldToLocal3D(t.world, t.FreezeAngle, t.Handedness)
-        }
-        const id = participantFromFilename(f.name)
-        next[id] = rows
-        firstNew ??= id
       } catch (e) {
         errors.push(`${f.name}: ${e.message ?? e}`)
       }
     }
-    setBundles(next)
-    if (firstNew) {
-      setParticipant(firstNew)
+    setHandBundles(nextHand)
+    setTrackerBundles(nextTracker)
+    if (firstNewTracker) {
+      setTrackerKey(firstNewTracker)
+      setDataset('tracker')
+      setSingleIdx(0)
+      if (mode === 'condition') setMode('single')
+    } else if (firstNewHand) {
+      setHandKey(firstNewHand)
+      setDataset('hand')
       setSingleIdx(0)
     }
     if (errors.length) setParseErr(errors.join('\n'))
-  }, [bundles])
+  }, [handBundles, trackerBundles, dataset, mode])
 
   const onDrop = useCallback(
     (e) => {
@@ -164,54 +212,119 @@ export default function App() {
     if (!v) return
     const url = v.snapshot()
     const a = document.createElement('a')
-    let name = participant ?? 'view'
-    if (mode === 'single') name += `_trial${trials[singleIdx]?.TrialNumber ?? singleIdx}`
-    else if (mode === 'condition') name += `_cond${condIdx}`
+    let name = activeKey ?? 'view'
+    if (mode === 'single') {
+      const t = trials[singleIdx]
+      const trialId = dataset === 'hand' ? t?.TrialNumber : t?.TrialIndex
+      name += `_trial${trialId ?? singleIdx}`
+    } else if (mode === 'condition') name += `_cond${condIdx}`
     else name += '_all'
     a.download = `${name}.png`
     a.href = url
     a.click()
-  }, [participant, mode, singleIdx, condIdx, trials])
+  }, [activeKey, mode, singleIdx, condIdx, trials, dataset])
 
-  // Info panel content (depends on mode).
+  // Info panel content.
   const info = (() => {
     if (!trials.length) return ''
+    if (dataset === 'hand') {
+      if (mode === 'single') {
+        const t = trials[singleIdx]
+        if (!t) return ''
+        return (
+          `Trial ${t.TrialNumber} · cfg ${t.ConfigurationId} · rep ${t.RepetitionNumber}\n` +
+          `R1=${t.R1}  R2=${t.R2}  speed=${t.RotationSpeed}°/s  dir=${t.Direction}\n` +
+          `freeze=${t.FreezeAngle.toFixed(1)}°  duration=${t.TracingDuration.toFixed(2)}s\n` +
+          `trace points: ${t.NumTracePoints}`
+        )
+      }
+      if (mode === 'condition') {
+        const ts = byCondition[condIdx] ?? []
+        if (!ts.length) return `Condition ${condIdx}: no trials`
+        const s = ts[0]
+        const meanDur = ts.reduce((a, t) => a + t.TracingDuration, 0) / ts.length
+        return (
+          `Condition ${condIdx} · ${ts.length} repetitions\n` +
+          `R1=${s.R1}  R2=${s.R2}  speed=${s.RotationSpeed}°/s  dir=${s.Direction}\n` +
+          `mean duration: ${meanDur.toFixed(2)}s`
+        )
+      }
+      const r2s = [...new Set(trials.map((t) => t.R2))]
+      return `All ${trials.length} trials overlaid\nR2 values: ${r2s.join(', ')}`
+    }
+    // tracker
     if (mode === 'single') {
       const t = trials[singleIdx]
       if (!t) return ''
+      const dir = t.RotationDirection > 0 ? 'CCW' : 'CW'
       return (
-        `Trial ${t.TrialNumber} · cfg ${t.ConfigurationId} · rep ${t.RepetitionNumber}\n` +
-        `R1=${t.R1}  R2=${t.R2}  speed=${t.RotationSpeed}°/s  dir=${t.Direction}\n` +
-        `freeze=${t.FreezeAngle.toFixed(1)}°  duration=${t.TracingDuration.toFixed(2)}s\n` +
-        `trace points: ${t.NumTracePoints}`
+        `Trial ${t.TrialIndex} · block ${t.Block} · in-block ${t.TrialInBlock}\n` +
+        `R1=${t.R1}  R2=${t.R2}  speed=${t.RotationSpeed}°/s  dir=${dir}\n` +
+        `duration=${t.TrialDuration.toFixed(2)}s  samples=${t.world.length}\n` +
+        `measured fps=${t.MeasuredFrameRateHz.toFixed(1)}`
       )
     }
-    if (mode === 'condition') {
-      const ts = byCondition[condIdx] ?? []
-      if (!ts.length) return `Condition ${condIdx}: no trials`
-      const s = ts[0]
-      const meanDur = ts.reduce((a, t) => a + t.TracingDuration, 0) / ts.length
-      return (
-        `Condition ${condIdx} · ${ts.length} repetitions\n` +
-        `R1=${s.R1}  R2=${s.R2}  speed=${s.RotationSpeed}°/s  dir=${s.Direction}\n` +
-        `mean duration: ${meanDur.toFixed(2)}s`
-      )
-    }
-    const r2s = [...new Set(trials.map((t) => t.R2))]
-    return `All ${trials.length} trials overlaid\nR2 values: ${r2s.join(', ')}`
+    const s = trials[0]
+    const meanDur = trials.reduce((a, t) => a + t.TrialDuration, 0) / trials.length
+    return (
+      `All ${trials.length} trials overlaid\n` +
+      `R1=${s.R1}  R2=${s.R2}  speed=${s.RotationSpeed}°/s  dir=${s.RotationDirection > 0 ? 'CCW' : 'CW'}\n` +
+      `mean duration: ${meanDur.toFixed(2)}s`
+    )
   })()
 
   // Legend rows.
   const legend = (() => {
     if (!trials.length) return null
+    if (dataset === 'hand') {
+      if (mode === 'single') {
+        const t = trials[singleIdx]
+        if (!t) return null
+        return (
+          <>
+            <div>
+              <span className="sw" style={{ background: hex(REP_COLORS[t.RepetitionNumber] ?? ALL_COLORS[0]) }} />
+              trace (rep {t.RepetitionNumber})
+            </div>
+            <div>
+              <span className="sw" style={{ background: '#a0b4dc' }} />
+              reference (R2={t.R2}, z=0)
+            </div>
+          </>
+        )
+      }
+      if (mode === 'condition') {
+        const ts = byCondition[condIdx] ?? []
+        return ts.map((t) => (
+          <div key={t.TrialNumber}>
+            <span className="sw" style={{ background: hex(REP_COLORS[t.RepetitionNumber] ?? ALL_COLORS[0]) }} />
+            rep {t.RepetitionNumber} (trial {t.TrialNumber})
+          </div>
+        ))
+      }
+      return (
+        <>
+          <div style={{ color: '#8891a3' }}>all {trials.length} trials</div>
+          {condIds.map((c) => {
+            const s = byCondition[c][0]
+            return (
+              <div key={c}>
+                cfg {c}: R1={s.R1} R2={s.R2} spd={s.RotationSpeed} dir={s.Direction}
+              </div>
+            )
+          })}
+        </>
+      )
+    }
+    // tracker
     if (mode === 'single') {
       const t = trials[singleIdx]
       if (!t) return null
       return (
         <>
           <div>
-            <span className="sw" style={{ background: hex(REP_COLORS[t.RepetitionNumber] ?? ALL_COLORS[0]) }} />
-            trace (rep {t.RepetitionNumber})
+            <span className="sw" style={{ background: hex(REP_COLORS[t.TrialIndex % REP_COLORS.length]) }} />
+            trace (trial {t.TrialIndex})
           </div>
           <div>
             <span className="sw" style={{ background: '#a0b4dc' }} />
@@ -220,29 +333,25 @@ export default function App() {
         </>
       )
     }
-    if (mode === 'condition') {
-      const ts = byCondition[condIdx] ?? []
-      return ts.map((t) => (
-        <div key={t.TrialNumber}>
-          <span className="sw" style={{ background: hex(REP_COLORS[t.RepetitionNumber] ?? ALL_COLORS[0]) }} />
-          rep {t.RepetitionNumber} (trial {t.TrialNumber})
-        </div>
-      ))
-    }
     return (
       <>
         <div style={{ color: '#8891a3' }}>all {trials.length} trials</div>
-        {condIds.map((c) => {
-          const s = byCondition[c][0]
-          return (
-            <div key={c}>
-              cfg {c}: R1={s.R1} R2={s.R2} spd={s.RotationSpeed} dir={s.Direction}
-            </div>
-          )
-        })}
+        {trials.map((t, i) => (
+          <div key={t.TrialIndex}>
+            <span className="sw" style={{ background: hex(ALL_COLORS[i % ALL_COLORS.length]) }} />
+            trial {t.TrialIndex}
+          </div>
+        ))}
       </>
     )
   })()
+
+  const datasetLabel = dataset === 'hand' ? 'Participant' : 'Session'
+  const dropHint =
+    dataset === 'hand'
+      ? <>or drop <code>*_Hand.csv</code> files anywhere</>
+      : <>or drop <code>RotatingTrace_*.csv</code> files anywhere</>
+  const setActiveKey = dataset === 'hand' ? setHandKey : setTrackerKey
 
   return (
     <div
@@ -256,6 +365,25 @@ export default function App() {
       onDrop={onDrop}
     >
       <div id="panel">
+        <h3>Dataset</h3>
+        <div className="modes">
+          {[
+            ['hand', 'Hand Tracking'],
+            ['tracker', 'Rotating Trace'],
+          ].map(([k, label]) => (
+            <button
+              key={k}
+              className={dataset === k ? 'active' : ''}
+              onClick={() => {
+                setDataset(k)
+                setSingleIdx(0)
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
         <h3>Data</h3>
         <label className="filebtn">
           <input
@@ -267,13 +395,13 @@ export default function App() {
           />
           choose files…
         </label>
-        <div className="hint-sm">or drop *_Hand.csv files anywhere</div>
+        <div className="hint-sm">{dropHint}</div>
 
-        <h3>Participant</h3>
+        <h3>{datasetLabel}</h3>
         <select
-          value={participant ?? ''}
+          value={activeKey ?? ''}
           onChange={(e) => {
-            setParticipant(e.target.value || null)
+            setActiveKey(e.target.value || null)
             setSingleIdx(0)
           }}
           disabled={!Object.keys(bundles).length}
@@ -288,7 +416,7 @@ export default function App() {
 
         <h3>View</h3>
         <div className="modes">
-          {['single', 'condition', 'all'].map((m) => (
+          {(dataset === 'hand' ? ['single', 'condition', 'all'] : ['single', 'all']).map((m) => (
             <button
               key={m}
               className={mode === m ? 'active' : ''}
@@ -319,7 +447,7 @@ export default function App() {
           </>
         )}
 
-        {mode === 'condition' && (
+        {dataset === 'hand' && mode === 'condition' && (
           <>
             <h3>Condition</h3>
             <div className="cond">
@@ -384,7 +512,9 @@ export default function App() {
         )}
         {!Object.keys(bundles).length && (
           <div className="empty">
-            drop one or more <code>*_Hand.csv</code> files here
+            drop one or more {dataset === 'hand'
+              ? <code>*_Hand.csv</code>
+              : <code>RotatingTrace_*.csv</code>} files here
           </div>
         )}
       </div>

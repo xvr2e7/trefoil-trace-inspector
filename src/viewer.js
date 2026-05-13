@@ -104,7 +104,7 @@ export class Viewer {
   resize() {
     const r = this.container.getBoundingClientRect()
     if (r.width === 0 || r.height === 0) return
-    this.renderer.setSize(r.width, r.height, false)
+    this.renderer.setSize(r.width, r.height)
     this.camera.aspect = r.width / r.height
     this.camera.updateProjectionMatrix()
   }
