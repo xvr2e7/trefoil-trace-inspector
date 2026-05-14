@@ -149,9 +149,16 @@ export function parseTrackerCsv(text) {
   return [...trials.values()].sort((a, b) => a.TrialIndex - b.TrialIndex);
 }
 
-// The trefoil rotates continuously, so each sample is de-rotated by its own
-// TrefoilAngleDeg:
-//   p_local[i] = R_z(-angle[i]) * (p_world[i] - STIM_CENTER) / STIM_SCALE
+// Each hand sample is de-rotated by its own TrefoilAngleDeg, placing all points
+// in a frame where the trefoil is stationary. The resulting 3D scatter is the
+// participant's perceived 3D shape of the trefoil.
+//
+//   p_local[i] = R_z(-TrefoilAngleDeg[i]) · (p_world[i] - STIM_CENTER) / STIM_SCALE
+//
+// Concretely: at sample i the trefoil has rotated by TrefoilAngleDeg[i] about Z.
+// Applying R_z(-TrefoilAngleDeg[i]) undoes that rotation per-sample, so every
+// point is expressed as if the trefoil never moved. The Z component is left
+// unchanged — it carries the depth the participant reported for that position.
 const STIM_CENTER = new THREE.Vector3(0, 1.0, 0.4);
 
 export function trackerLocal3D(worldPts, anglesDeg) {
