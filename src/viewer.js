@@ -135,6 +135,12 @@ export class Viewer {
     this.clearGroup(this.traceGroup)
   }
 
+  // Clear only the trace group, leaving the reference curve in place.
+  // Used by movie mode so the reference is not rebuilt on every frame.
+  clearTraces() {
+    this.clearGroup(this.traceGroup)
+  }
+
   addReference(refPts) {
     const g = new THREE.BufferGeometry()
     const arr = new Float32Array(refPts.length * 3)
@@ -148,6 +154,26 @@ export class Viewer {
       color: 0xa0b4dc,
       transparent: true,
       opacity: 0.35,
+      depthWrite: false,
+    })
+    this.refGroup.add(new THREE.Line(g, mat))
+  }
+
+  // 3D reference curve (calib nearest-curve ground truth). Unlike addReference
+  // this preserves the actual z values rather than forcing z=0.
+  addRef3D(points) {
+    const g = new THREE.BufferGeometry()
+    const arr = new Float32Array(points.length * 3)
+    for (let i = 0; i < points.length; i++) {
+      arr[3 * i] = points[i].x
+      arr[3 * i + 1] = points[i].y
+      arr[3 * i + 2] = points[i].z
+    }
+    g.setAttribute('position', new THREE.BufferAttribute(arr, 3))
+    const mat = new THREE.LineBasicMaterial({
+      color: 0x70e0c0,
+      transparent: true,
+      opacity: 0.55,
       depthWrite: false,
     })
     this.refGroup.add(new THREE.Line(g, mat))

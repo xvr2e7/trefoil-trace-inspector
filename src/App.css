@@ -90,6 +90,32 @@ html, body, #root {
   border-top: 1px solid #2a2f3a;
   padding-top: 10px;
 }
+
+.movie-label {
+  font-size: 11px;
+  color: #8891a3;
+  min-width: 28px;
+  text-align: center;
+  flex-shrink: 0;
+}
+#movie-warn {
+  font-size: 10px;
+  color: #c8973a;
+  background: #18140b;
+  border: 1px solid #3a2f10;
+  border-radius: 4px;
+  padding: 6px 8px;
+  line-height: 1.55;
+  display: grid;
+  gap: 3px;
+}
+.movie-warn-hdr {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #8a6824;
+  margin-bottom: 2px;
+}
 #err {
   font-size: 11px;
   color: #ff8a9b;
