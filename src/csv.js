@@ -147,7 +147,7 @@ export function parseTrackerCsv(text) {
   return [...trials.values()].sort((a, b) => a.TrialIndex - b.TrialIndex);
 }
 
-// Trefoil stimulus: center (0, 1, 0.8), scale 0.1 — matches Unity scene.
+// Trefoil stimulus: center (0, 1, 0.65), scale 0.1 — matches Unity scene.
 //
 // De-rotation for RotatingTrace: the trefoil rotates around Z.
 //   p_local[i] = R_z(-TrefoilAngleDeg[i]) · (p_world[i] - STIM_CENTER) / STIM_SCALE
@@ -155,7 +155,7 @@ export function parseTrackerCsv(text) {
 // Undoing the Z-rotation per sample places every point in a frame where the
 // trefoil is stationary. The Z component carries the depth the participant
 // reported for that position on the curve.
-const STIM_CENTER = new THREE.Vector3(0, 1.0, 0.8);
+const STIM_CENTER = new THREE.Vector3(0, 1.0, 0.65);
 const STIM_SCALE = 0.1;
 
 export function trackerLocal3D(worldPts, anglesDeg) {
@@ -179,74 +179,88 @@ export function sessionFromFilename(name) {
 }
 
 // ---------------------------------------------------------------------------
-// Calibration files (`RotatingTrace_Calib3D_*.csv`).
+// Calibration files (`RotatingTrace_Calib_*.csv`).
 // ---------------------------------------------------------------------------
-// Each row is one tracker sample. The 3D trefoil ground truth is known and
-// rotates around the Y-axis. NearestCurveXYZ is the closest point on the
-// 3D trefoil to the tracker position in world space, at ModelRotationYDeg.
-export function parseCalib3DCsv(text) {
+// One file per session; all 5 calibration phases are stored together,
+// distinguished by the TrialType column:
+//   cube_static         – static cube              (no NearestCurve data; angles = 0)
+//   cube_rotating       – rotating cube            (no NearestCurve data; angles = 0)
+//   trefoil2d_static    – flat 2D ribbon, paused   (no NearestCurve data; angles = 0)
+//   trefoil3d_static    – 3D model, static         (NearestCurve populated; angles = 0)
+//   trefoil3d_rotating  – 3D model, Z-rotating     (NearestCurve + ModelRotYDeg populated)
+//
+// TrialIndex repeats 0..N-1 within each phase, so rows are grouped by the
+// composite key (TrialType, TrialIndex) to prevent cross-phase collision.
+// `hasCurve` is true only for trefoil3d_* rows where NearestCurveXYZ is
+// non-zero; `localNearest` will be null for all other types.
+export function parseCalibCsv(text) {
   const lines = text.split(/\r?\n/).filter((l) => l.length > 0);
   if (lines.length < 2) return [];
   const header = lines[0].split(",").map((h) => h.trim());
   const col = Object.fromEntries(header.map((h, i) => [h, i]));
   const required = [
-    "CalibTrialIndex", "PointIndex",
-    "TrackerWorldX", "TrackerWorldY", "TrackerWorldZ",
+    "TrialType", "TrialIndex", "PointIndex",
+    "WorldX", "WorldY", "WorldZ",
     "NearestCurveX", "NearestCurveY", "NearestCurveZ",
-    "NearestPhi", "ModelRotationYDeg", "TimeStamp", "TrialDuration",
+    "NearestPhi", "ModelRotYDeg", "TimeStamp", "TrialDuration",
   ];
   for (const k of required) {
     if (!(k in col)) throw new Error(`missing column: ${k}`);
   }
 
   const trials = new Map();
+  let seqId = 0;
   for (let i = 1; i < lines.length; i++) {
     const f = lines[i].split(",");
     if (f.length < header.length) continue;
-    const tid = +f[col.CalibTrialIndex];
-    let t = trials.get(tid);
+    const trialType = f[col.TrialType].trim();
+    const trialIdx  = +f[col.TrialIndex];
+    const key = `${trialType}_${trialIdx}`;
+    let t = trials.get(key);
     if (!t) {
       t = {
-        CalibTrialIndex: tid,
+        CalibTrialIndex: seqId++,
+        TrialType: trialType,
+        TrialIndex: trialIdx,
         TrialDuration: +f[col.TrialDuration],
+        hasCurve: false,
         world: [],
         nearest: [],
         phis: [],
         angles: [],
         times: [],
       };
-      trials.set(tid, t);
+      trials.set(key, t);
     }
-    t.world.push({
-      x: +f[col.TrackerWorldX],
-      y: +f[col.TrackerWorldY],
-      z: +f[col.TrackerWorldZ],
-    });
-    t.nearest.push({
-      x: +f[col.NearestCurveX],
-      y: +f[col.NearestCurveY],
-      z: +f[col.NearestCurveZ],
-    });
+    t.world.push({ x: +f[col.WorldX], y: +f[col.WorldY], z: +f[col.WorldZ] });
+    const nx = +f[col.NearestCurveX];
+    const ny = +f[col.NearestCurveY];
+    const nz = +f[col.NearestCurveZ];
+    t.nearest.push({ x: nx, y: ny, z: nz });
+    if (nx !== 0 || ny !== 0 || nz !== 0) t.hasCurve = true;
     t.phis.push(+f[col.NearestPhi]);
-    t.angles.push(+f[col.ModelRotationYDeg]);
+    t.angles.push(+f[col.ModelRotYDeg]);
     t.times.push(+f[col.TimeStamp]);
   }
   return [...trials.values()].sort((a, b) => a.CalibTrialIndex - b.CalibTrialIndex);
 }
 
-// De-rotation for Calib3D: the 3D trefoil rotates around Y.
-//   p_local[i] = R_y(-ModelRotationYDeg[i]) · (p_world[i] - STIM_CENTER) / STIM_SCALE
+// De-rotation for calib trefoil trials.
 //
-// Apply to both TrackerWorld and NearestCurve to bring both into the
-// trefoil's stationary local frame. NearestCurve de-rotated reconstructs
-// the known 3D trefoil shape; TrackerWorld de-rotated shows the participant's
-// trace in that same frame.
+// Both FourierTrefoil3D (3D calib model, SetRotationMode zAxis:true) and
+// TrefoilGenerator (2D main ribbon) rotate around the Z-axis:
+//   transform.localRotation = Quaternion.Euler(0, 0, angle)
 //
-// R_y(-θ) applied to [px, py, pz]:
-//   x' =  cos(θ)·px + sin(θ)·pz  (equivalently: ca·px + sa·pz with a = -θ, sa = -sin(θ))
-//   y' =  py
-//   z' = -sin(θ)·px + cos(θ)·pz  (equivalently: -sa·px + ca·pz)
-export function calib3DLocal3D(worldPts, anglesDeg) {
+// `ModelRotYDeg` in the CSV stores the cumulative Z-rotation angle
+// (the field is named after an older Y-axis design; the value is Z).
+//
+// De-rotation formula — identical to trackerLocal3D:
+//   p_local[i] = R_z(-angle[i]) · (p_world[i] - STIM_CENTER) / STIM_SCALE
+//
+// Apply to both world and nearest-curve points to bring them into the
+// trefoil's stationary local frame. For static trials (angles all 0) this
+// reduces to a plain translate+scale.
+export function calibDerotate(worldPts, anglesDeg) {
   const out = new Array(worldPts.length);
   for (let i = 0; i < worldPts.length; i++) {
     const a = -THREE.MathUtils.degToRad(anglesDeg[i]);
@@ -255,16 +269,15 @@ export function calib3DLocal3D(worldPts, anglesDeg) {
     const px = (worldPts[i].x - STIM_CENTER.x) / STIM_SCALE;
     const py = (worldPts[i].y - STIM_CENTER.y) / STIM_SCALE;
     const pz = (worldPts[i].z - STIM_CENTER.z) / STIM_SCALE;
-    // R_y(a) where a = -θ  →  R_y(-θ)
-    out[i] = { x: ca * px + sa * pz, y: py, z: -sa * px + ca * pz };
+    out[i] = { x: ca * px - sa * py, y: sa * px + ca * py, z: pz };
   }
   return out;
 }
 
-// "RotatingTrace_Calib3D_20260513_151342.csv" → "20260513_151342".
+// "RotatingTrace_Calib_20260513_151342.csv" → "20260513_151342".
 export function sessionFromCalibFilename(name) {
   const base = name.replace(/\.csv$/i, "");
-  return base.replace(/^RotatingTrace_Calib3D_/i, "") || base;
+  return base.replace(/^RotatingTrace_Calib_/i, "") || base;
 }
 
 // ---------------------------------------------------------------------------
@@ -289,8 +302,8 @@ function unwrapAngles(angles) {
  * Split a trial into per-rotation-cycle frames for the movie view.
  *
  * Works for both RotatingTrace (Z-axis rotation, TrefoilAngleDeg) and
- * Calib3D (Y-axis rotation, ModelRotationYDeg) — both store their rotation
- * series in `trial.angles`.
+ * calib trefoil trials (Z-axis rotation, ModelRotYDeg) — both store their
+ * rotation series in `trial.angles`.
  *
  * `trial.local3D` must already be populated (done during file ingestion).
  * If `trial.localNearest` is present (calib data), it is partitioned into
@@ -381,8 +394,10 @@ export function partitionIntoCycles(trial) {
 }
 
 // ---------------------------------------------------------------------------
-// Shared reference outline.
+// Shared reference curves.
 // ---------------------------------------------------------------------------
+
+// 2D flat reference (z forced to 0) — used for main-experiment and trefoil2d_static.
 const refCache = {};
 export async function loadReference(R2, baseUrl) {
   const key = R2.toFixed(1);
@@ -401,5 +416,29 @@ export async function loadReference(R2, baseUrl) {
     });
   pts.push({ ...pts[0] });
   refCache[key] = pts;
+  return pts;
+}
+
+// 3D reference curve (z from coords CSV * amplitude) — used for trefoil3d_* calib types.
+// The coords CSV was generated with the same R1/R2 as the calibration model, so x, y, z
+// directly match the canonical local-space coordinates after calibDerotate.
+const ref3DCache = {};
+export async function loadReference3D(R2, amplitude, baseUrl) {
+  const key = `${R2.toFixed(1)}_${amplitude.toFixed(3)}`;
+  if (ref3DCache[key]) return ref3DCache[key];
+  const url = `${baseUrl}reference/coords_R2_${R2.toFixed(1)}.csv`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`reference fetch failed: ${url}`);
+  const text = await res.text();
+  const pts = text
+    .trim()
+    .split(/\r?\n/)
+    .slice(1)
+    .map((l) => {
+      const [, x, y, z] = l.split(",").map(Number);
+      return { x, y, z: z * amplitude };
+    });
+  pts.push({ ...pts[0] });
+  ref3DCache[key] = pts;
   return pts;
 }

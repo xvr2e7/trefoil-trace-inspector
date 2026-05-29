@@ -179,6 +179,36 @@ export class Viewer {
     this.refGroup.add(new THREE.Line(g, mat))
   }
 
+  // Wireframe cube with 12 edges. center and halfEdge are in the same local-space
+  // units as trace points. Uses THREE.LineSegments so no phantom diagonals appear.
+  addWireframeCube(center, halfEdge) {
+    const h = halfEdge
+    const { x: cx, y: cy, z: cz } = center
+    const v = [
+      [cx - h, cy - h, cz - h], [cx + h, cy - h, cz - h],
+      [cx + h, cy + h, cz - h], [cx - h, cy + h, cz - h],
+      [cx - h, cy - h, cz + h], [cx + h, cy - h, cz + h],
+      [cx + h, cy + h, cz + h], [cx - h, cy + h, cz + h],
+    ]
+    const edges = [
+      [0,1],[1,2],[2,3],[3,0],
+      [4,5],[5,6],[6,7],[7,4],
+      [0,4],[1,5],[2,6],[3,7],
+    ]
+    const pos = new Float32Array(edges.length * 6)
+    let k = 0
+    for (const [a, b] of edges) {
+      pos[k++] = v[a][0]; pos[k++] = v[a][1]; pos[k++] = v[a][2]
+      pos[k++] = v[b][0]; pos[k++] = v[b][1]; pos[k++] = v[b][2]
+    }
+    const g = new THREE.BufferGeometry()
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3))
+    const mat = new THREE.LineBasicMaterial({
+      color: 0x70e0c0, transparent: true, opacity: 0.55, depthWrite: false,
+    })
+    this.refGroup.add(new THREE.LineSegments(g, mat))
+  }
+
   addTrace(points, colorHex, opts = {}) {
     const g = new THREE.BufferGeometry()
     const arr = new Float32Array(points.length * 3)

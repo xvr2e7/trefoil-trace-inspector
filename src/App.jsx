@@ -3,13 +3,17 @@ import './App.css'
 import {
   parseHandCsv, handLocal3D, participantFromFilename,
   parseTrackerCsv, trackerLocal3D, sessionFromFilename,
-  parseCalib3DCsv, calib3DLocal3D, sessionFromCalibFilename,
-  loadReference, partitionIntoCycles,
+  parseCalibCsv, calibDerotate, sessionFromCalibFilename,
+  loadReference, loadReference3D, partitionIntoCycles,
 } from './csv.js'
 import { Viewer, REP_COLORS, ALL_COLORS } from './viewer.js'
 
 const BASE_URL = import.meta.env.BASE_URL
 const MIN_POINTS = 10
+// Calibration stimulus parameters — must match Unity inspector values in
+// RotatingTraceExperimentManager (R2) and FourierTrefoil3D (calibAmplitude).
+const CALIB_R2 = 1.5
+const CALIB_AMPLITUDE = 1.0
 
 function hex(c) {
   return '#' + c.toString(16).padStart(6, '0')
@@ -17,7 +21,7 @@ function hex(c) {
 
 // 'hand' | 'tracker' | 'calib' — falls back to null for unrecognised files.
 function datasetFromFilename(name) {
-  if (/^RotatingTrace_Calib3D_/i.test(name)) return 'calib'
+  if (/^RotatingTrace_Calib_/i.test(name)) return 'calib'
   if (/^RotatingTrace_/i.test(name)) return 'tracker'
   if (/_Hand\.csv$/i.test(name)) return 'hand'
   return null
@@ -41,6 +45,7 @@ export default function App() {
   const [mode, setMode] = useState('single') // 'single' | 'condition' (hand only) | 'all' | 'movie' (tracker/calib)
   const [singleIdx, setSingleIdx] = useState(0)
   const [condIdx, setCondIdx] = useState(0)
+  const [calibTypeFilter, setCalibTypeFilter] = useState('trefoil3d_rotating')
   const [showRef, setShowRef] = useState(true)
   const [dragOver, setDragOver] = useState(false)
   const [parseErr, setParseErr] = useState(null)
@@ -56,7 +61,13 @@ export default function App() {
 
   const bundles = dataset === 'hand' ? handBundles : dataset === 'tracker' ? trackerBundles : calibBundles
   const activeKey = dataset === 'hand' ? handKey : dataset === 'tracker' ? trackerKey : calibKey
-  const trials = activeKey ? bundles[activeKey] ?? [] : []
+  // For calib dataset, apply TrialType filter before passing to all rendering
+  // paths. For hand/tracker datasets, returns the raw bundle unchanged.
+  const trials = useMemo(() => {
+    const all = (activeKey && bundles[activeKey]) ? bundles[activeKey] : []
+    if (dataset !== 'calib' || calibTypeFilter === 'all') return all
+    return all.filter((t) => t.TrialType === calibTypeFilter)
+  }, [bundles, activeKey, dataset, calibTypeFilter])
 
   const byCondition = useMemo(() => {
     if (dataset !== 'hand') return {}
@@ -90,6 +101,9 @@ export default function App() {
     if (dataset === 'hand' && mode === 'movie') setMode('single')
   }, [dataset, mode])
 
+  // Reset trial index when calib type filter changes (filtered list may be shorter).
+  useEffect(() => { setSingleIdx(0) }, [calibTypeFilter])
+
   // Re-render scene whenever the chosen view changes (non-movie modes).
   useEffect(() => {
     const v = viewerRef.current
@@ -105,6 +119,7 @@ export default function App() {
           const t = trials[Math.min(singleIdx, trials.length - 1)]
           if (!t) return
           if (showRef && t.localNearest?.length) v.addRef3D(t.localNearest)
+          if (showRef && t.cubeRef) v.addWireframeCube(t.cubeRef.center, t.cubeRef.halfEdge)
           v.addTrace(t.local3D, REP_COLORS[t.CalibTrialIndex % REP_COLORS.length], {
             showDots: true, alpha: 1.0,
           })
@@ -113,6 +128,7 @@ export default function App() {
           for (let i = 0; i < trials.length; i++) {
             const t = trials[i]
             if (showRef && t.localNearest?.length) v.addRef3D(t.localNearest)
+            if (showRef && t.cubeRef) v.addWireframeCube(t.cubeRef.center, t.cubeRef.halfEdge)
             v.addTrace(t.local3D, ALL_COLORS[i % ALL_COLORS.length], {
               alpha: 0.55, showDots: true, dotSize: 0.03,
             })
@@ -234,11 +250,13 @@ export default function App() {
     const idx = ((movieFrameIdx % numFrames) + numFrames) % numFrames
     const frame = frames[idx]
 
+    const movieTrial = trials[Math.min(singleIdx, trials.length - 1)]
     v.clearAll()
     // Tracker: 2D flat reference loaded from server.
     if (movieRefPts) v.addReference(movieRefPts)
-    // Calib: 3D ground-truth nearest-curve for this cycle.
+    // Calib: curve or cube ground truth for this trial.
     if (frame.nearestCurve?.length && showRef) v.addRef3D(frame.nearestCurve)
+    if (movieTrial?.cubeRef && showRef) v.addWireframeCube(movieTrial.cubeRef.center, movieTrial.cubeRef.halfEdge)
 
     const color = frame.isPartial ? 0x888888 : REP_COLORS[idx % REP_COLORS.length]
     v.addTrace(frame.local3D, color, { showDots: true, alpha: 1.0 })
@@ -263,14 +281,35 @@ export default function App() {
       try {
         const text = await f.text()
         if (kind === 'calib') {
-          const rows = parseCalib3DCsv(text).filter((t) => t.world.length >= MIN_POINTS)
+          const rows = parseCalibCsv(text).filter((t) => t.world.length >= MIN_POINTS)
           if (!rows.length) {
             errors.push(`${f.name}: 0 trials with ≥${MIN_POINTS} points`)
             continue
           }
+          // Ground truth per trial type:
+          //   trefoil2d_static        → 2D flat curve at z=0 from coords CSV
+          //   trefoil3d_static/rotating → 3D curve from coords CSV, z scaled by CALIB_AMPLITUDE
+          //   cube_*                  → wireframe cube; center estimated from data centroid,
+          //                            halfEdge = 0.3m / (2 * 0.1) = 1.5 in trefoil-local units
+          const TREFOIL_TYPES = new Set(['trefoil2d_static', 'trefoil3d_static', 'trefoil3d_rotating'])
           for (const t of rows) {
-            t.local3D = calib3DLocal3D(t.world, t.angles)
-            t.localNearest = calib3DLocal3D(t.nearest, t.angles)
+            t.local3D = calibDerotate(t.world, t.angles)
+            if (TREFOIL_TYPES.has(t.TrialType)) {
+              t.hasCurve = true
+              t.cubeRef = null
+              t.localNearest = t.TrialType === 'trefoil2d_static'
+                ? await loadReference(CALIB_R2, BASE_URL)
+                : await loadReference3D(CALIB_R2, CALIB_AMPLITUDE, BASE_URL)
+            } else {
+              // Estimate cube center from centroid of de-rotated trace points
+              const n = t.local3D.length
+              const cx = t.local3D.reduce((s, p) => s + p.x, 0) / n
+              const cy = t.local3D.reduce((s, p) => s + p.y, 0) / n
+              const cz = t.local3D.reduce((s, p) => s + p.z, 0) / n
+              t.hasCurve = true
+              t.cubeRef = { center: { x: cx, y: cy, z: cz }, halfEdge: 1.5 }
+              t.localNearest = null
+            }
           }
           const id = sessionFromCalibFilename(f.name)
           nextCalib[id] = rows
@@ -382,18 +421,20 @@ export default function App() {
           `Cycle ${idx + 1} / ${numFrames}${frame.isPartial ? ' (partial — grey)' : ''}\n` +
           `angle span: ${frame.angleRange.toFixed(0)}°  samples: ${frame.local3D.length}\n` +
           `time: [${t0}s, ${t1}s]\n` +
-          `Calib trial ${t.CalibTrialIndex}  duration=${t.TrialDuration.toFixed(2)}s`
+          `${t.TrialType} · trial ${t.TrialIndex}  duration=${t.TrialDuration.toFixed(2)}s`
         )
       }
       if (mode === 'single') {
         const t = trials[Math.min(singleIdx, trials.length - 1)]
         if (!t) return ''
         return (
-          `Calib trial ${t.CalibTrialIndex}\n` +
-          `duration=${t.TrialDuration.toFixed(2)}s  samples=${t.world.length}`
+          `${t.TrialType} · trial ${t.TrialIndex}\n` +
+          `duration=${t.TrialDuration.toFixed(2)}s  samples=${t.world.length}` +
+          (t.hasCurve ? '  [ground truth ✓]' : '')
         )
       }
-      return `All ${trials.length} calib trials overlaid`
+      const types = [...new Set(trials.map((t) => t.TrialType))].join(', ')
+      return `${trials.length} calib trials  [${types}]`
     }
 
     if (dataset === 'hand') {
@@ -478,10 +519,10 @@ export default function App() {
               <span className="sw" style={{ background: hex(color) }} />
               cycle {idx + 1}/{numFrames}{frame.isPartial ? ' (partial)' : ''}
             </div>
-            {showRef && t && (
+            {showRef && t && t.hasCurve && (
               <div>
                 <span className="sw" style={{ background: '#70e0c0' }} />
-                ground truth (nearest curve)
+                {t.cubeRef ? 'cube wireframe (est. center)' : 'ground truth'}
               </div>
             )}
             <div style={{ color: '#5a6070', marginTop: 4 }}>grey = partial cycle</div>
@@ -495,12 +536,12 @@ export default function App() {
           <>
             <div>
               <span className="sw" style={{ background: hex(REP_COLORS[t.CalibTrialIndex % REP_COLORS.length]) }} />
-              tracker trace (calib {t.CalibTrialIndex})
+              {t.TrialType} · trial {t.TrialIndex}
             </div>
-            {showRef && (
+            {showRef && t.hasCurve && (
               <div>
                 <span className="sw" style={{ background: '#70e0c0' }} />
-                ground truth (nearest curve)
+                {t.cubeRef ? 'cube wireframe (est. center)' : 'ground truth'}
               </div>
             )}
           </>
@@ -512,7 +553,7 @@ export default function App() {
           {trials.map((t, i) => (
             <div key={t.CalibTrialIndex}>
               <span className="sw" style={{ background: hex(ALL_COLORS[i % ALL_COLORS.length]) }} />
-              calib {t.CalibTrialIndex}
+              {t.TrialType} · {t.TrialIndex}
             </div>
           ))}
           {showRef && (
@@ -624,11 +665,11 @@ export default function App() {
   const dropHint = dataset === 'hand'
     ? <>or drop <code>*_Hand.csv</code> files anywhere</>
     : dataset === 'calib'
-    ? <>or drop <code>RotatingTrace_Calib3D_*.csv</code> files anywhere</>
+    ? <>or drop <code>RotatingTrace_Calib_*.csv</code> files anywhere</>
     : <>or drop <code>RotatingTrace_*.csv</code> files anywhere</>
   const setActiveKey = dataset === 'hand' ? setHandKey : dataset === 'tracker' ? setTrackerKey : setCalibKey
 
-  const refLabel = dataset === 'calib' ? '3D ground-truth curve' : '2D outline at z=0'
+  const refLabel = dataset === 'calib' ? 'ground-truth curve' : '2D outline at z=0'
   const modesForDataset = dataset === 'hand'
     ? ['single', 'condition', 'all']
     : ['single', 'all', 'movie']
@@ -810,6 +851,22 @@ export default function App() {
           </>
         )}
 
+        {dataset === 'calib' && (
+          <>
+            <h3>Trial Type</h3>
+            <select
+              value={calibTypeFilter}
+              onChange={(e) => { setCalibTypeFilter(e.target.value); setSingleIdx(0) }}
+              disabled={!Object.keys(calibBundles).length}
+            >
+              <option value="all">all types</option>
+              {[...new Set((activeKey && calibBundles[activeKey] ? calibBundles[activeKey] : []).map((t) => t.TrialType))].sort().map((type) => (
+                <option key={type} value={type}>{type}</option>
+              ))}
+            </select>
+          </>
+        )}
+
         <h3>Camera</h3>
         <div className="views">
           {[
@@ -859,7 +916,7 @@ export default function App() {
           <div className="empty">
             drop one or more{' '}
             {dataset === 'hand' ? <code>*_Hand.csv</code>
-              : dataset === 'calib' ? <code>RotatingTrace_Calib3D_*.csv</code>
+              : dataset === 'calib' ? <code>RotatingTrace_Calib_*.csv</code>
               : <code>RotatingTrace_*.csv</code>}{' '}
             files here
           </div>
