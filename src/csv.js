@@ -207,6 +207,7 @@ export function parseCalibCsv(text) {
   for (const k of required) {
     if (!(k in col)) throw new Error(`missing column: ${k}`);
   }
+  const hasOnCurveData = 'DistanceToCurve' in col && 'IsOnCurve' in col;
 
   const trials = new Map();
   let seqId = 0;
@@ -229,6 +230,8 @@ export function parseCalibCsv(text) {
         phis: [],
         angles: [],
         times: [],
+        distanceToCurve: hasOnCurveData ? [] : null,
+        isOnCurve:       hasOnCurveData ? [] : null,
       };
       trials.set(key, t);
     }
@@ -241,6 +244,12 @@ export function parseCalibCsv(text) {
     t.phis.push(+f[col.NearestPhi]);
     t.angles.push(+f[col.ModelRotYDeg]);
     t.times.push(+f[col.TimeStamp]);
+    if (hasOnCurveData) {
+      const dStr = f[col.DistanceToCurve].trim();
+      t.distanceToCurve.push(dStr === '' ? NaN : +dStr);
+      const ocStr = f[col.IsOnCurve].trim();
+      t.isOnCurve.push(ocStr === '' ? NaN : +ocStr);
+    }
   }
   return [...trials.values()].sort((a, b) => a.CalibTrialIndex - b.CalibTrialIndex);
 }

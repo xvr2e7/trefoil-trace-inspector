@@ -120,11 +120,12 @@ export default function App() {
           if (!t) return
           if (showRef && t.localNearest?.length) v.addRef3D(t.localNearest)
           if (showRef && t.cubeRef) v.addWireframeCube(t.cubeRef.center, t.cubeRef.halfEdge)
+          const perPoint = t.isOnCurve ? t.isOnCurve.map((v) => v === 1) : null
           v.addTrace(t.local3D, REP_COLORS[t.CalibTrialIndex % REP_COLORS.length], {
-            showDots: true, alpha: 1.0,
+            showDots: true, alpha: 1.0, isOnCurve: perPoint,
           })
         } else {
-          // all
+          // all — keep per-trial colors so trials are distinguishable
           for (let i = 0; i < trials.length; i++) {
             const t = trials[i]
             if (showRef && t.localNearest?.length) v.addRef3D(t.localNearest)
@@ -427,14 +428,34 @@ export default function App() {
       if (mode === 'single') {
         const t = trials[Math.min(singleIdx, trials.length - 1)]
         if (!t) return ''
+        let onCurveInfo = ''
+        if (t.isOnCurve) {
+          const valid = t.isOnCurve.filter((v) => !isNaN(v))
+          const onN = valid.filter((v) => v === 1).length
+          const pct = valid.length ? (onN / valid.length * 100).toFixed(1) : '—'
+          const validDist = (t.distanceToCurve || []).filter((v) => !isNaN(v))
+          const meanMm = validDist.length
+            ? (validDist.reduce((s, v) => s + v, 0) / validDist.length * 1000).toFixed(1)
+            : '—'
+          onCurveInfo = `\non-curve: ${onN}/${valid.length} pts (${pct}%)  mean dist: ${meanMm}mm`
+        }
         return (
           `${t.TrialType} · trial ${t.TrialIndex}\n` +
           `duration=${t.TrialDuration.toFixed(2)}s  samples=${t.world.length}` +
-          (t.hasCurve ? '  [ground truth ✓]' : '')
+          (t.hasCurve ? '  [ground truth ✓]' : '') +
+          onCurveInfo
         )
       }
       const types = [...new Set(trials.map((t) => t.TrialType))].join(', ')
-      return `${trials.length} calib trials  [${types}]`
+      const trialsWithOC = trials.filter((t) => t.isOnCurve)
+      let aggInfo = ''
+      if (trialsWithOC.length) {
+        const allValid = trialsWithOC.flatMap((t) => t.isOnCurve.filter((v) => !isNaN(v)))
+        const onN = allValid.filter((v) => v === 1).length
+        const pct = allValid.length ? (onN / allValid.length * 100).toFixed(1) : '—'
+        aggInfo = `\non-curve: ${onN}/${allValid.length} pts (${pct}%) across ${trialsWithOC.length} trials`
+      }
+      return `${trials.length} calib trials  [${types}]` + aggInfo
     }
 
     if (dataset === 'hand') {
@@ -534,10 +555,17 @@ export default function App() {
         if (!t) return null
         return (
           <>
-            <div>
-              <span className="sw" style={{ background: hex(REP_COLORS[t.CalibTrialIndex % REP_COLORS.length]) }} />
-              {t.TrialType} · trial {t.TrialIndex}
-            </div>
+            {t.isOnCurve ? (
+              <>
+                <div><span className="sw" style={{ background: '#88ff44' }} />on curve</div>
+                <div><span className="sw" style={{ background: '#ffcc00' }} />off curve</div>
+              </>
+            ) : (
+              <div>
+                <span className="sw" style={{ background: hex(REP_COLORS[t.CalibTrialIndex % REP_COLORS.length]) }} />
+                {t.TrialType} · trial {t.TrialIndex}
+              </div>
+            )}
             {showRef && t.hasCurve && (
               <div>
                 <span className="sw" style={{ background: '#70e0c0' }} />

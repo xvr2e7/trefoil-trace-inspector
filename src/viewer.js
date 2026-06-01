@@ -218,8 +218,24 @@ export class Viewer {
       arr[3 * i + 2] = points[i].z
     }
     g.setAttribute('position', new THREE.BufferAttribute(arr, 3))
+
+    // opts.isOnCurve: bool[] — when present, each point is colored green (true) or yellow (false)
+    const perPoint = opts.isOnCurve
+    if (perPoint?.length) {
+      const ON  = new THREE.Color(0x88ff44)
+      const OFF = new THREE.Color(0xffcc00)
+      const ca = new Float32Array(points.length * 3)
+      for (let i = 0; i < points.length; i++) {
+        const c = perPoint[i] ? ON : OFF
+        ca[3 * i] = c.r; ca[3 * i + 1] = c.g; ca[3 * i + 2] = c.b
+      }
+      g.setAttribute('color', new THREE.BufferAttribute(ca, 3))
+    }
+
+    const useVtxColors = !!(perPoint?.length)
     const lineMat = new THREE.LineBasicMaterial({
-      color: colorHex,
+      color: useVtxColors ? 0xffffff : colorHex,
+      vertexColors: useVtxColors,
       transparent: true,
       opacity: opts.alpha ?? 1.0,
       depthWrite: false,
@@ -228,7 +244,8 @@ export class Viewer {
     grp.add(new THREE.Line(g, lineMat))
     if (opts.showDots) {
       const pm = new THREE.PointsMaterial({
-        color: colorHex,
+        color: useVtxColors ? 0xffffff : colorHex,
+        vertexColors: useVtxColors,
         size: opts.dotSize ?? 0.06,
         transparent: true,
         opacity: opts.alpha ?? 1.0,
