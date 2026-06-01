@@ -120,9 +120,8 @@ export default function App() {
           if (!t) return
           if (showRef && t.localNearest?.length) v.addRef3D(t.localNearest)
           if (showRef && t.cubeRef) v.addWireframeCube(t.cubeRef.center, t.cubeRef.halfEdge)
-          const perPoint = t.isOnCurve ? t.isOnCurve.map((v) => v === 1) : null
           v.addTrace(t.local3D, REP_COLORS[t.CalibTrialIndex % REP_COLORS.length], {
-            showDots: true, alpha: 1.0, isOnCurve: perPoint,
+            showDots: true, alpha: 1.0,
           })
         } else {
           // all — keep per-trial colors so trials are distinguishable
@@ -555,17 +554,10 @@ export default function App() {
         if (!t) return null
         return (
           <>
-            {t.isOnCurve ? (
-              <>
-                <div><span className="sw" style={{ background: '#88ff44' }} />on curve</div>
-                <div><span className="sw" style={{ background: '#ffcc00' }} />off curve</div>
-              </>
-            ) : (
-              <div>
-                <span className="sw" style={{ background: hex(REP_COLORS[t.CalibTrialIndex % REP_COLORS.length]) }} />
-                {t.TrialType} · trial {t.TrialIndex}
-              </div>
-            )}
+            <div>
+              <span className="sw" style={{ background: hex(REP_COLORS[t.CalibTrialIndex % REP_COLORS.length]) }} />
+              {t.TrialType} · trial {t.TrialIndex}
+            </div>
             {showRef && t.hasCurve && (
               <div>
                 <span className="sw" style={{ background: '#70e0c0' }} />
