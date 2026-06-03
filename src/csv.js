@@ -147,7 +147,7 @@ export function parseTrackerCsv(text) {
   return [...trials.values()].sort((a, b) => a.TrialIndex - b.TrialIndex);
 }
 
-// Trefoil stimulus: center (0, 1, 0.65), scale 0.1 — matches Unity scene.
+// Trefoil stimulus: center (0, 1, 0.65), scale 0.08 — matches Unity scene.
 //
 // De-rotation for RotatingTrace: the trefoil rotates around Z.
 //   p_local[i] = R_z(-TrefoilAngleDeg[i]) · (p_world[i] - STIM_CENTER) / STIM_SCALE
@@ -155,18 +155,19 @@ export function parseTrackerCsv(text) {
 // Undoing the Z-rotation per sample places every point in a frame where the
 // trefoil is stationary. The Z component carries the depth the participant
 // reported for that position on the curve.
-const STIM_CENTER = new THREE.Vector3(0, 1.0, 0.65);
-const STIM_SCALE = 0.1;
+export const DEFAULT_STIM_CENTER = { x: 0, y: 1.0, z: 0.65 }
+export const DEFAULT_STIM_SCALE = 0.08
+export const DEFAULT_CUBE_SCALE = 0.8  // Unity inspector cube GameObject scale
 
-export function trackerLocal3D(worldPts, anglesDeg) {
+export function trackerLocal3D(worldPts, anglesDeg, center = DEFAULT_STIM_CENTER, scale = DEFAULT_STIM_SCALE) {
   const out = new Array(worldPts.length);
   for (let i = 0; i < worldPts.length; i++) {
     const a = -THREE.MathUtils.degToRad(anglesDeg[i]);
     const ca = Math.cos(a);
     const sa = Math.sin(a);
-    const px = (worldPts[i].x - STIM_CENTER.x) / STIM_SCALE;
-    const py = (worldPts[i].y - STIM_CENTER.y) / STIM_SCALE;
-    const pz = (worldPts[i].z - STIM_CENTER.z) / STIM_SCALE;
+    const px = (worldPts[i].x - center.x) / scale;
+    const py = (worldPts[i].y - center.y) / scale;
+    const pz = (worldPts[i].z - center.z) / scale;
     out[i] = { x: ca * px - sa * py, y: sa * px + ca * py, z: pz };
   }
   return out;
@@ -269,15 +270,15 @@ export function parseCalibCsv(text) {
 // Apply to both world and nearest-curve points to bring them into the
 // trefoil's stationary local frame. For static trials (angles all 0) this
 // reduces to a plain translate+scale.
-export function calibDerotate(worldPts, anglesDeg) {
+export function calibDerotate(worldPts, anglesDeg, center = DEFAULT_STIM_CENTER, scale = DEFAULT_STIM_SCALE) {
   const out = new Array(worldPts.length);
   for (let i = 0; i < worldPts.length; i++) {
     const a = -THREE.MathUtils.degToRad(anglesDeg[i]);
     const ca = Math.cos(a);
     const sa = Math.sin(a);
-    const px = (worldPts[i].x - STIM_CENTER.x) / STIM_SCALE;
-    const py = (worldPts[i].y - STIM_CENTER.y) / STIM_SCALE;
-    const pz = (worldPts[i].z - STIM_CENTER.z) / STIM_SCALE;
+    const px = (worldPts[i].x - center.x) / scale;
+    const py = (worldPts[i].y - center.y) / scale;
+    const pz = (worldPts[i].z - center.z) / scale;
     out[i] = { x: ca * px - sa * py, y: sa * px + ca * py, z: pz };
   }
   return out;

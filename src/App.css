@@ -83,6 +83,21 @@ html, body, #root {
 .cond button:disabled { opacity: 0.4; cursor: not-allowed; }
 .export:disabled { opacity: 0.4; cursor: not-allowed; }
 
+.cfg-grid { display: grid; gap: 4px; }
+.cfg-row { display: flex; gap: 6px; align-items: center; }
+.cfg-row label { font-size: 11px; color: #8891a3; min-width: 76px; flex-shrink: 0; }
+.cfg-row input[type="number"] {
+  flex: 1;
+  width: 0;
+  background: #1a1e27;
+  color: #e6e8ee;
+  border: 1px solid #2a2f3a;
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 12px;
+}
+.cfg-row input[type="number"]:focus { outline: none; border-color: #5a7cb5; }
+
 #info {
   font-size: 12px;
   color: #a8afbd;

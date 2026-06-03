@@ -5,6 +5,7 @@ import {
   parseTrackerCsv, trackerLocal3D, sessionFromFilename,
   parseCalibCsv, calibDerotate, sessionFromCalibFilename,
   loadReference, loadReference3D, partitionIntoCycles,
+  DEFAULT_STIM_CENTER, DEFAULT_STIM_SCALE, DEFAULT_CUBE_SCALE,
 } from './csv.js'
 import { Viewer, REP_COLORS, ALL_COLORS } from './viewer.js'
 
@@ -14,6 +15,14 @@ const MIN_POINTS = 10
 // RotatingTraceExperimentManager (R2) and FourierTrefoil3D (calibAmplitude).
 const CALIB_R2 = 1.5
 const CALIB_AMPLITUDE = 1.0
+
+const DEFAULT_CONFIG = {
+  cx: DEFAULT_STIM_CENTER.x,
+  cy: DEFAULT_STIM_CENTER.y,
+  cz: DEFAULT_STIM_CENTER.z,
+  stimScale: DEFAULT_STIM_SCALE,
+  cubeScale: DEFAULT_CUBE_SCALE,
+}
 
 function hex(c) {
   return '#' + c.toString(16).padStart(6, '0')
@@ -41,6 +50,10 @@ export default function App() {
   const [handKey, setHandKey] = useState(null)
   const [trackerKey, setTrackerKey] = useState(null)
   const [calibKey, setCalibKey] = useState(null)
+
+  // Scene config: trefoil/cube position + scale exposed for runtime tuning.
+  const [stimConfig, setStimConfig] = useState(DEFAULT_CONFIG)
+  const [draftConfig, setDraftConfig] = useState(DEFAULT_CONFIG)
 
   const [mode, setMode] = useState('single') // 'single' | 'condition' (hand only) | 'all' | 'movie' (tracker/calib)
   const [singleIdx, setSingleIdx] = useState(0)
@@ -262,6 +275,43 @@ export default function App() {
     v.addTrace(frame.local3D, color, { showDots: true, alpha: 1.0 })
   }, [mode, movieResult, movieFrameIdx, movieRefPts, showRef])
 
+  // Re-derive local3D for all loaded tracker + calib bundles when config changes.
+  const applyStimConfig = useCallback((cfg) => {
+    const center = { x: cfg.cx, y: cfg.cy, z: cfg.cz }
+    const scale = cfg.stimScale
+    const halfEdge = (cfg.cubeScale / 2) / cfg.stimScale
+
+    setTrackerBundles((prev) => {
+      if (!Object.keys(prev).length) return prev
+      const next = {}
+      for (const [key, rows] of Object.entries(prev)) {
+        next[key] = rows.map((t) => ({ ...t, local3D: trackerLocal3D(t.world, t.angles, center, scale) }))
+      }
+      return next
+    })
+
+    setCalibBundles((prev) => {
+      if (!Object.keys(prev).length) return prev
+      const next = {}
+      for (const [key, rows] of Object.entries(prev)) {
+        next[key] = rows.map((t) => {
+          const local3D = calibDerotate(t.world, t.angles, center, scale)
+          if (t.cubeRef !== null) {
+            const n = local3D.length
+            const cx = local3D.reduce((s, p) => s + p.x, 0) / n
+            const cy = local3D.reduce((s, p) => s + p.y, 0) / n
+            const cz = local3D.reduce((s, p) => s + p.z, 0) / n
+            return { ...t, local3D, cubeRef: { center: { x: cx, y: cy, z: cz }, halfEdge } }
+          }
+          return { ...t, local3D }
+        })
+      }
+      return next
+    })
+
+    setStimConfig(cfg)
+  }, [])
+
   const ingestFiles = useCallback(async (files) => {
     setParseErr(null)
     const csvFiles = [...files].filter((f) => /\.csv$/i.test(f.name))
@@ -276,6 +326,9 @@ export default function App() {
     let firstNewTracker = null
     let firstNewCalib = null
     const errors = []
+    const cfgCenter = { x: stimConfig.cx, y: stimConfig.cy, z: stimConfig.cz }
+    const cfgScale = stimConfig.stimScale
+    const cfgHalfEdge = (stimConfig.cubeScale / 2) / stimConfig.stimScale
     for (const f of csvFiles) {
       const kind = datasetFromFilename(f.name) ?? dataset
       try {
@@ -290,10 +343,10 @@ export default function App() {
           //   trefoil2d_static        → 2D flat curve at z=0 from coords CSV
           //   trefoil3d_static/rotating → 3D curve from coords CSV, z scaled by CALIB_AMPLITUDE
           //   cube_*                  → wireframe cube; center estimated from data centroid,
-          //                            halfEdge = 0.3m / (2 * 0.1) = 1.5 in trefoil-local units
+          //                            halfEdge = (cubeScale/2) / stimScale in trefoil-local units
           const TREFOIL_TYPES = new Set(['trefoil2d_static', 'trefoil3d_static', 'trefoil3d_rotating'])
           for (const t of rows) {
-            t.local3D = calibDerotate(t.world, t.angles)
+            t.local3D = calibDerotate(t.world, t.angles, cfgCenter, cfgScale)
             if (TREFOIL_TYPES.has(t.TrialType)) {
               t.hasCurve = true
               t.cubeRef = null
@@ -307,7 +360,7 @@ export default function App() {
               const cy = t.local3D.reduce((s, p) => s + p.y, 0) / n
               const cz = t.local3D.reduce((s, p) => s + p.z, 0) / n
               t.hasCurve = true
-              t.cubeRef = { center: { x: cx, y: cy, z: cz }, halfEdge: 1.5 }
+              t.cubeRef = { center: { x: cx, y: cy, z: cz }, halfEdge: cfgHalfEdge }
               t.localNearest = null
             }
           }
@@ -320,7 +373,7 @@ export default function App() {
             errors.push(`${f.name}: 0 trials with ≥${MIN_POINTS} points`)
             continue
           }
-          for (const t of rows) t.local3D = trackerLocal3D(t.world, t.angles)
+          for (const t of rows) t.local3D = trackerLocal3D(t.world, t.angles, cfgCenter, cfgScale)
           const id = sessionFromFilename(f.name)
           nextTracker[id] = rows
           firstNewTracker ??= id
@@ -359,7 +412,7 @@ export default function App() {
       setSingleIdx(0)
     }
     if (errors.length) setParseErr(errors.join('\n'))
-  }, [handBundles, trackerBundles, calibBundles, dataset, mode])
+  }, [handBundles, trackerBundles, calibBundles, dataset, mode, stimConfig])
 
   const onDrop = useCallback(
     (e) => {
@@ -905,6 +958,43 @@ export default function App() {
         <label>
           <input type="checkbox" checked={showRef} onChange={(e) => setShowRef(e.target.checked)} /> {refLabel}
         </label>
+
+        <h3>Scene Config</h3>
+        <div className="cfg-grid">
+          {[['cx', 'pos X'], ['cy', 'pos Y'], ['cz', 'pos Z']].map(([k, label]) => (
+            <div key={k} className="cfg-row">
+              <label>{label}</label>
+              <input
+                type="number"
+                step="0.01"
+                value={draftConfig[k]}
+                onChange={(e) => setDraftConfig((c) => ({ ...c, [k]: +e.target.value }))}
+              />
+            </div>
+          ))}
+          <div className="cfg-row">
+            <label>trefoil scale</label>
+            <input
+              type="number"
+              step="0.001"
+              value={draftConfig.stimScale}
+              onChange={(e) => setDraftConfig((c) => ({ ...c, stimScale: +e.target.value }))}
+            />
+          </div>
+          <div className="cfg-row">
+            <label>cube scale</label>
+            <input
+              type="number"
+              step="0.01"
+              value={draftConfig.cubeScale}
+              onChange={(e) => setDraftConfig((c) => ({ ...c, cubeScale: +e.target.value }))}
+            />
+          </div>
+        </div>
+        <div className="row">
+          <button style={{ flex: 1 }} onClick={() => applyStimConfig(draftConfig)}>Apply</button>
+          <button onClick={() => { setDraftConfig(DEFAULT_CONFIG); applyStimConfig(DEFAULT_CONFIG) }}>Reset</button>
+        </div>
 
         <h3>Export</h3>
         <button className="export" onClick={onExport} disabled={!trials.length}>
