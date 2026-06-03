@@ -5,7 +5,7 @@ import {
   parseTrackerCsv, trackerLocal3D, sessionFromFilename,
   parseCalibCsv, calibDerotate, sessionFromCalibFilename,
   loadReference, loadReference3D, partitionIntoCycles,
-  DEFAULT_STIM_CENTER, DEFAULT_STIM_SCALE, DEFAULT_CUBE_SCALE,
+  DEFAULT_STIM_CENTER, DEFAULT_STIM_SCALE, DEFAULT_CUBE_WORLD_EDGE,
 } from './csv.js'
 import { Viewer, REP_COLORS, ALL_COLORS } from './viewer.js'
 
@@ -21,7 +21,7 @@ const DEFAULT_CONFIG = {
   cy: DEFAULT_STIM_CENTER.y,
   cz: DEFAULT_STIM_CENTER.z,
   stimScale: DEFAULT_STIM_SCALE,
-  cubeScale: DEFAULT_CUBE_SCALE,
+  cubeWorldEdge: DEFAULT_CUBE_WORLD_EDGE,
 }
 
 function hex(c) {
@@ -279,7 +279,7 @@ export default function App() {
   const applyStimConfig = useCallback((cfg) => {
     const center = { x: cfg.cx, y: cfg.cy, z: cfg.cz }
     const scale = cfg.stimScale
-    const halfEdge = (cfg.cubeScale / 2) / cfg.stimScale
+    const halfEdge = (cfg.cubeWorldEdge / 2) / cfg.stimScale  // local units
 
     setTrackerBundles((prev) => {
       if (!Object.keys(prev).length) return prev
@@ -328,7 +328,7 @@ export default function App() {
     const errors = []
     const cfgCenter = { x: stimConfig.cx, y: stimConfig.cy, z: stimConfig.cz }
     const cfgScale = stimConfig.stimScale
-    const cfgHalfEdge = (stimConfig.cubeScale / 2) / stimConfig.stimScale
+    const cfgHalfEdge = (stimConfig.cubeWorldEdge / 2) / stimConfig.stimScale
     for (const f of csvFiles) {
       const kind = datasetFromFilename(f.name) ?? dataset
       try {
@@ -343,7 +343,7 @@ export default function App() {
           //   trefoil2d_static        → 2D flat curve at z=0 from coords CSV
           //   trefoil3d_static/rotating → 3D curve from coords CSV, z scaled by CALIB_AMPLITUDE
           //   cube_*                  → wireframe cube; center estimated from data centroid,
-          //                            halfEdge = (cubeScale/2) / stimScale in trefoil-local units
+          //                            halfEdge = (cubeWorldEdge/2) / stimScale in trefoil-local units
           const TREFOIL_TYPES = new Set(['trefoil2d_static', 'trefoil3d_static', 'trefoil3d_rotating'])
           for (const t of rows) {
             t.local3D = calibDerotate(t.world, t.angles, cfgCenter, cfgScale)
@@ -982,12 +982,12 @@ export default function App() {
             />
           </div>
           <div className="cfg-row">
-            <label>cube scale</label>
+            <label>cube edge (m)</label>
             <input
               type="number"
               step="0.01"
-              value={draftConfig.cubeScale}
-              onChange={(e) => setDraftConfig((c) => ({ ...c, cubeScale: +e.target.value }))}
+              value={draftConfig.cubeWorldEdge}
+              onChange={(e) => setDraftConfig((c) => ({ ...c, cubeWorldEdge: +e.target.value }))}
             />
           </div>
         </div>

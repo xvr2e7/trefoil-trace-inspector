@@ -157,7 +157,9 @@ export function parseTrackerCsv(text) {
 // reported for that position on the curve.
 export const DEFAULT_STIM_CENTER = { x: 0, y: 1.0, z: 0.65 }
 export const DEFAULT_STIM_SCALE = 0.08
-export const DEFAULT_CUBE_SCALE = 0.8  // Unity inspector cube GameObject scale
+// World-space edge length = CubeCalibrator.edgeLength × cube transform scale.
+// Default: edgeLength 0.3 × transformScale 0.8 = 0.24 m.
+export const DEFAULT_CUBE_WORLD_EDGE = 0.24
 
 export function trackerLocal3D(worldPts, anglesDeg, center = DEFAULT_STIM_CENTER, scale = DEFAULT_STIM_SCALE) {
   const out = new Array(worldPts.length);
