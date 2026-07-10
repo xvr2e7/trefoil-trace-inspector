@@ -296,12 +296,12 @@ export default function App() {
       for (const [key, rows] of Object.entries(prev)) {
         next[key] = rows.map((t) => {
           const local3D = calibDerotate(t.world, t.angles, center, scale)
+          // Cube shares the trefoil's world position (verified against Rotating Trace.unity:
+          // both are root objects with identical m_LocalPosition), so its center in the
+          // de-rotated local frame is the origin — same fixed ground truth as the trefoil
+          // reference curve, not estimated from the trace itself.
           if (t.cubeRef !== null) {
-            const n = local3D.length
-            const cx = local3D.reduce((s, p) => s + p.x, 0) / n
-            const cy = local3D.reduce((s, p) => s + p.y, 0) / n
-            const cz = local3D.reduce((s, p) => s + p.z, 0) / n
-            return { ...t, local3D, cubeRef: { center: { x: cx, y: cy, z: cz }, halfEdge } }
+            return { ...t, local3D, cubeRef: { center: { x: 0, y: 0, z: 0 }, halfEdge } }
           }
           return { ...t, local3D }
         })
@@ -342,7 +342,8 @@ export default function App() {
           // Ground truth per trial type:
           //   trefoil2d_static        → 2D flat curve at z=0 from coords CSV
           //   trefoil3d_static/rotating → 3D curve from coords CSV, z scaled by CALIB_AMPLITUDE
-          //   cube_*                  → wireframe cube; center estimated from data centroid,
+          //   cube_*                  → wireframe cube at the local-frame origin (cube shares the
+          //                            trefoil's world position — verified against Rotating Trace.unity),
           //                            halfEdge = (cubeWorldEdge/2) / stimScale in trefoil-local units
           const TREFOIL_TYPES = new Set(['trefoil2d_static', 'trefoil3d_static', 'trefoil3d_rotating'])
           for (const t of rows) {
@@ -354,13 +355,8 @@ export default function App() {
                 ? await loadReference(CALIB_R2, BASE_URL)
                 : await loadReference3D(CALIB_R2, CALIB_AMPLITUDE, BASE_URL)
             } else {
-              // Estimate cube center from centroid of de-rotated trace points
-              const n = t.local3D.length
-              const cx = t.local3D.reduce((s, p) => s + p.x, 0) / n
-              const cy = t.local3D.reduce((s, p) => s + p.y, 0) / n
-              const cz = t.local3D.reduce((s, p) => s + p.z, 0) / n
               t.hasCurve = true
-              t.cubeRef = { center: { x: cx, y: cy, z: cz }, halfEdge: cfgHalfEdge }
+              t.cubeRef = { center: { x: 0, y: 0, z: 0 }, halfEdge: cfgHalfEdge }
               t.localNearest = null
             }
           }
@@ -595,7 +591,7 @@ export default function App() {
             {showRef && t && t.hasCurve && (
               <div>
                 <span className="sw" style={{ background: '#70e0c0' }} />
-                {t.cubeRef ? 'cube wireframe (est. center)' : 'ground truth'}
+                {t.cubeRef ? 'cube wireframe (ground truth)' : 'ground truth'}
               </div>
             )}
             <div style={{ color: '#5a6070', marginTop: 4 }}>grey = partial cycle</div>
@@ -614,7 +610,7 @@ export default function App() {
             {showRef && t.hasCurve && (
               <div>
                 <span className="sw" style={{ background: '#70e0c0' }} />
-                {t.cubeRef ? 'cube wireframe (est. center)' : 'ground truth'}
+                {t.cubeRef ? 'cube wireframe (ground truth)' : 'ground truth'}
               </div>
             )}
           </>
