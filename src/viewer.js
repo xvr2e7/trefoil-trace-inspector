@@ -183,6 +183,10 @@ export class Viewer {
 
   // Wireframe cube with 12 edges. center and halfEdge are in the same local-space
   // units as trace points. Uses THREE.LineSegments so no phantom diagonals appear.
+  // Two brightnesses, matching what the participant saw: CubeCalibrator scores
+  // only the 9 edges of its polylineOrder, and the headset shader dims the
+  // other 3. Drawing all 12 alike invites reading distances off edges that were
+  // never traced — worth up to 24 mm on real traces.
   addWireframeCube(center, halfEdge) {
     const h = halfEdge
     const { x: cx, y: cy, z: cz } = center
@@ -192,23 +196,22 @@ export class Viewer {
       [cx - h, cy - h, cz + h], [cx + h, cy - h, cz + h],
       [cx + h, cy + h, cz + h], [cx - h, cy + h, cz + h],
     ]
-    const edges = [
-      [0,1],[1,2],[2,3],[3,0],
-      [4,5],[5,6],[6,7],[7,4],
-      [0,4],[1,5],[2,6],[3,7],
-    ]
-    const pos = new Float32Array(edges.length * 6)
-    let k = 0
-    for (const [a, b] of edges) {
-      pos[k++] = v[a][0]; pos[k++] = v[a][1]; pos[k++] = v[a][2]
-      pos[k++] = v[b][0]; pos[k++] = v[b][1]; pos[k++] = v[b][2]
+    const traced = [[0,1],[1,2],[2,3],[3,0],[0,4],[4,5],[5,6],[6,7],[7,4]]
+    const untraced = [[1,5],[2,6],[3,7]]
+    for (const [edges, opacity] of [[traced, 0.55], [untraced, 0.15]]) {
+      const pos = new Float32Array(edges.length * 6)
+      let k = 0
+      for (const [a, b] of edges) {
+        pos[k++] = v[a][0]; pos[k++] = v[a][1]; pos[k++] = v[a][2]
+        pos[k++] = v[b][0]; pos[k++] = v[b][1]; pos[k++] = v[b][2]
+      }
+      const g = new THREE.BufferGeometry()
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3))
+      const mat = new THREE.LineBasicMaterial({
+        color: 0x70e0c0, transparent: true, opacity, depthWrite: false,
+      })
+      this.refGroup.add(new THREE.LineSegments(g, mat))
     }
-    const g = new THREE.BufferGeometry()
-    g.setAttribute('position', new THREE.BufferAttribute(pos, 3))
-    const mat = new THREE.LineBasicMaterial({
-      color: 0x70e0c0, transparent: true, opacity: 0.55, depthWrite: false,
-    })
-    this.refGroup.add(new THREE.LineSegments(g, mat))
   }
 
   addTrace(points, colorHex, opts = {}) {

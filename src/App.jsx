@@ -7,9 +7,9 @@ import {
   parseEllipseTrajCsv, parseEllipseSummaryCsv, sessionFromEllipseFilename,
   ellipseDerotate, fitEllipseTrace, bestCircleFit, loggedLocalResidual,
   predictedCircle, flatEllipse,
-  loadReference, loadReference3D, partitionIntoCycles,
+  loadReference, loadReference3D, partitionIntoCycles, fitCubeSpin,
   DEFAULT_STIM_CENTER, DEFAULT_STIM_SCALE, DEFAULT_CUBE_WORLD_EDGE,
-  DEFAULT_DISK_DIAMETER,
+  DEFAULT_CUBE_SPIN_SPEED, DEFAULT_DISK_DIAMETER,
 } from './csv.js'
 import { Viewer, REP_COLORS, ALL_COLORS } from './viewer.js'
 
@@ -27,11 +27,51 @@ const DEFAULT_CONFIG = {
   cz: DEFAULT_STIM_CENTER.z,
   stimScale: DEFAULT_STIM_SCALE,
   cubeWorldEdge: DEFAULT_CUBE_WORLD_EDGE,
+  cubeSpinSpeed: DEFAULT_CUBE_SPIN_SPEED,
   diskDiameter: DEFAULT_DISK_DIAMETER,
 }
 
 function hex(c) {
   return '#' + c.toString(16).padStart(6, '0')
+}
+
+// cube_rotating trials carry ModelRotYDeg=0 for every sample — Unity never
+// sampled the cube's angle — so de-rotating them straight from the file freezes
+// a cube that was spinning. Recover the angle from DistanceToCurve instead (see
+// fitCubeSpin). Mutates and returns the trial; the file's own column is kept in
+// `rawAngles` so a re-fit after a config change starts from the same place.
+function applyCubeSpin(t, center, worldEdge, speed) {
+  if (t.TrialType !== 'cube_rotating') return t
+  t.rawAngles ??= t.angles
+  // A future Unity build that logs the angle wins over any fit.
+  if (t.rawAngles.some((a) => a !== 0)) {
+    t.angles = t.rawAngles
+    t.spinFit = null
+    return t
+  }
+  const fit = fitCubeSpin(t.world, t.distanceToCurve, t.times, { center, worldEdge, speed })
+  t.spinFit = fit
+  t.angles = fit?.confident ? fit.angles : t.rawAngles
+  return t
+}
+
+// One line about where a rotating cube's angle came from. A good fit sits at
+// the CSV's rounding floor (~0.04 mm) and beats its nearest 90° alias by three
+// orders of magnitude; anything else means the cube is drawn where the file
+// claims it was, which for these trials is wrong but at least honest.
+function spinInfo(t) {
+  if (t.TrialType !== 'cube_rotating') return ''
+  if (!t.spinFit) {
+    return t.rawAngles?.some((a) => a !== 0)
+      ? '\nspin: read from ModelRotYDeg'
+      : '\nspin: NOT recovered (no DistanceToCurve) — cube drawn unrotated'
+  }
+  const { theta0, omega, rms, aliasRms, confident, n } = t.spinFit
+  const head = `\nspin ${confident ? 'recovered' : 'FIT REJECTED'}: ` +
+    `${omega.toFixed(2)}°/s  θ₀=${theta0.toFixed(2)}°  fit ${(rms * 1000).toFixed(3)}mm (${n} pts)`
+  return confident
+    ? head + `  [90° alias ${(aliasRms * 1000).toFixed(0)}mm]`
+    : head + '\n  ambiguous — cube drawn unrotated'
 }
 
 // 'hand' | 'tracker' | 'calib' | 'ellipse' | 'ellipse-summary' — falls back to
@@ -372,7 +412,8 @@ export default function App() {
       if (!Object.keys(prev).length) return prev
       const next = {}
       for (const [key, rows] of Object.entries(prev)) {
-        next[key] = rows.map((t) => {
+        next[key] = rows.map((row) => {
+          const t = applyCubeSpin({ ...row }, center, cfg.cubeWorldEdge, cfg.cubeSpinSpeed)
           const local3D = calibDerotate(t.world, t.angles, center, scale)
           // Cube shares the trefoil's world position (verified against Rotating Trace.unity:
           // both are root objects with identical m_LocalPosition), so its center in the
@@ -482,6 +523,7 @@ export default function App() {
           //                            halfEdge = (cubeWorldEdge/2) / stimScale in trefoil-local units
           const TREFOIL_TYPES = new Set(['trefoil2d_static', 'trefoil3d_static', 'trefoil3d_rotating'])
           for (const t of rows) {
+            applyCubeSpin(t, cfgCenter, stimConfig.cubeWorldEdge, stimConfig.cubeSpinSpeed)
             t.local3D = calibDerotate(t.world, t.angles, cfgCenter, cfgScale)
             if (TREFOIL_TYPES.has(t.TrialType)) {
               t.hasCurve = true
@@ -702,7 +744,8 @@ export default function App() {
           `Cycle ${idx + 1} / ${numFrames}${frame.isPartial ? ' (partial — grey)' : ''}\n` +
           `angle span: ${frame.angleRange.toFixed(0)}°  samples: ${frame.local3D.length}\n` +
           `time: [${t0}s, ${t1}s]\n` +
-          `${t.TrialType} · trial ${t.TrialIndex}  duration=${t.TrialDuration.toFixed(2)}s`
+          `${t.TrialType} · trial ${t.TrialIndex}  duration=${t.TrialDuration.toFixed(2)}s` +
+          spinInfo(t)
         )
       }
       if (mode === 'single') {
@@ -723,7 +766,8 @@ export default function App() {
           `${t.TrialType} · trial ${t.TrialIndex}\n` +
           `duration=${t.TrialDuration.toFixed(2)}s  samples=${t.world.length}` +
           (t.hasCurve ? '  [ground truth ✓]' : '') +
-          onCurveInfo
+          onCurveInfo +
+          spinInfo(t)
         )
       }
       const types = [...new Set(trials.map((t) => t.TrialType))].join(', ')
@@ -1286,6 +1330,17 @@ export default function App() {
               step="0.01"
               value={draftConfig.cubeWorldEdge}
               onChange={(e) => setDraftConfig((c) => ({ ...c, cubeWorldEdge: +e.target.value }))}
+            />
+          </div>
+          <div className="cfg-row">
+            <label title="cubeRotationSpeed in the Unity scene. The cube's angle is missing from the CSV, so it is fitted at this rate (both directions tried).">
+              cube spin (°/s)
+            </label>
+            <input
+              type="number"
+              step="1"
+              value={draftConfig.cubeSpinSpeed}
+              onChange={(e) => setDraftConfig((c) => ({ ...c, cubeSpinSpeed: +e.target.value }))}
             />
           </div>
           <div className="cfg-row">

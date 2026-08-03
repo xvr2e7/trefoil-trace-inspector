@@ -160,6 +160,9 @@ export const DEFAULT_STIM_SCALE = 0.08
 // World-space edge length = CubeCalibrator.edgeLength × cube transform scale.
 // Default: edgeLength 0.3 × transformScale 0.8 = 0.24 m.
 export const DEFAULT_CUBE_WORLD_EDGE = 0.24
+// RotatingTraceExperimentManager.cubeRotationSpeed, applied about the cube's
+// local Z by CubeCalibrator.Update.
+export const DEFAULT_CUBE_SPIN_SPEED = 30
 
 export function trackerLocal3D(worldPts, anglesDeg, center = DEFAULT_STIM_CENTER, scale = DEFAULT_STIM_SCALE) {
   const out = new Array(worldPts.length);
@@ -187,7 +190,8 @@ export function sessionFromFilename(name) {
 // One file per session; all 5 calibration phases are stored together,
 // distinguished by the TrialType column:
 //   cube_static         – static cube              (no NearestCurve data; angles = 0)
-//   cube_rotating       – rotating cube            (no NearestCurve data; angles = 0)
+//   cube_rotating       – rotating cube            (no NearestCurve data; angles = 0
+//                                                   in the file — recovered by fitCubeSpin)
 //   trefoil2d_static    – flat 2D ribbon, paused   (no NearestCurve data; angles = 0)
 //   trefoil3d_static    – 3D model, static         (NearestCurve populated; angles = 0)
 //   trefoil3d_rotating  – 3D model, Z-rotating     (NearestCurve + ModelRotYDeg populated)
@@ -290,6 +294,167 @@ export function calibDerotate(worldPts, anglesDeg, center = DEFAULT_STIM_CENTER,
 export function sessionFromCalibFilename(name) {
   const base = name.replace(/\.csv$/i, "");
   return base.replace(/^RotatingTrace_Calib_/i, "") || base;
+}
+
+// ---------------------------------------------------------------------------
+// Recovering the rotating cube's spin angle.
+// ---------------------------------------------------------------------------
+// Unity never wrote it. RecordCalibPoint() samples a rotation angle only for
+// trefoil3d_* trials, so every cube_rotating row carries ModelRotYDeg=0 even
+// though CubeCalibrator really spins the cube at cubeRotationSpeed about its
+// local Z. De-rotating with those zeros freezes a cube that was moving: on real
+// trials it misplaces the trace relative to the cube by 27-32 mm rms (up to
+// 12 cm) and halves the apparent on-cube fraction.
+//
+// The angle survives in the data anyway. DistanceToCurve was measured live
+// against the truly rotated cube, so it pins the angle down at every sample.
+// Fitting theta(t) = theta0 + omega·(t - t_first) against it recovers omega to
+// ±0.05 deg/s and theta0 to ±0.05 deg on real 30 s trials, with an rms
+// residual of 0.04 mm — the CSV's own 4-decimal rounding floor — and
+// reproduces the logged IsOnCurve fraction to within 0.2 points.
+//
+// One caveat the caller should surface: the 9 scored edges are a square front
+// face, a square back face and ONE connecting depth edge, so the residual is
+// nearly 4-fold symmetric about Z. Only that single depth edge tells theta from
+// theta+90. Whole trials resolve cleanly (the 90 deg aliases cost 18-27 mm rms
+// against 0.04 mm for the true angle), but a short fragment can settle on an
+// alias, so the fit reports its margin over the best one.
+
+// Cube corners in CubeCalibrator's local frame, in units of half an edge.
+// Order matches CubeCalibrator.localVertices.
+const CUBE_CORNERS = [
+  [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+  [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
+];
+// CubeCalibrator.polylineOrder = {0,1,2,3,0,4,5,6,7,4} as edges: the 9 the
+// participant traces, and the only ones DistanceToCurve is measured against.
+export const CUBE_TRACED_EDGES = [
+  [0, 1], [1, 2], [2, 3], [3, 0], [0, 4], [4, 5], [5, 6], [6, 7], [7, 4],
+];
+// The 3 remaining edges. Drawn in the headset (dimmed by the shader) but never
+// scored — including them changes distances by up to 24 mm on real traces.
+export const CUBE_UNTRACED_EDGES = [[1, 5], [2, 6], [3, 7]];
+
+const MIN_SPIN_FIT_POINTS = 30;
+const SPIN_FIT_COARSE_SAMPLES = 250;   // decimation for the 1-degree sweep
+const SPIN_FIT_ALIAS_SEPARATION = 45;  // degrees; anything closer is the same minimum
+
+// Traced edges as {ax,ay,az, ux,uy,uz, len} for a cube at rest, centred on the
+// origin. Points get rotated into this frame rather than the cube out of it.
+function tracedEdgeSegments(halfEdge) {
+  return CUBE_TRACED_EDGES.map(([i, j]) => {
+    const a = CUBE_CORNERS[i].map((v) => v * halfEdge);
+    const b = CUBE_CORNERS[j].map((v) => v * halfEdge);
+    const dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2];
+    const len = Math.hypot(dx, dy, dz);
+    return { ax: a[0], ay: a[1], az: a[2], ux: dx / len, uy: dy / len, uz: dz / len, len };
+  });
+}
+
+function distToSegments(x, y, z, segs) {
+  let best = Infinity;
+  for (const s of segs) {
+    const px = x - s.ax, py = y - s.ay, pz = z - s.az;
+    let t = px * s.ux + py * s.uy + pz * s.uz;
+    if (t < 0) t = 0; else if (t > s.len) t = s.len;
+    const ex = px - t * s.ux, ey = py - t * s.uy, ez = pz - t * s.uz;
+    const d = ex * ex + ey * ey + ez * ez;
+    if (d < best) best = d;
+  }
+  return Math.sqrt(best);
+}
+
+// rms gap between the distance a spinning cube would have produced and the
+// distance Unity logged.
+function spinResidual(pts, dists, dts, segs, center, theta0, omega) {
+  let sum = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = -((theta0 + omega * dts[i]) * Math.PI) / 180;
+    const ca = Math.cos(a), sa = Math.sin(a);
+    const qx = pts[i].x - center.x, qy = pts[i].y - center.y;
+    const d = distToSegments(ca * qx - sa * qy, sa * qx + ca * qy, pts[i].z - center.z, segs);
+    const e = d - dists[i];
+    sum += e * e;
+  }
+  return Math.sqrt(sum / pts.length);
+}
+
+// Returns { angles, theta0, omega, rms, aliasRms, confident, n } or null when
+// the trial carries no usable DistanceToCurve column.
+// `angles` covers every sample, ready to hand to calibDerotate.
+export function fitCubeSpin(worldPts, distanceToCurve, times, {
+  center = DEFAULT_STIM_CENTER,
+  worldEdge = DEFAULT_CUBE_WORLD_EDGE,
+  speed = DEFAULT_CUBE_SPIN_SPEED,
+} = {}) {
+  if (!worldPts?.length || !distanceToCurve || !times?.length) return null;
+
+  const pts = [], dists = [], dts = [];
+  const t0 = times[0];
+  for (let i = 0; i < worldPts.length; i++) {
+    if (!Number.isFinite(distanceToCurve[i])) continue;
+    pts.push(worldPts[i]);
+    dists.push(distanceToCurve[i]);
+    dts.push(times[i] - t0);
+  }
+  if (pts.length < MIN_SPIN_FIT_POINTS) return null;
+
+  const segs = tracedEdgeSegments(worldEdge / 2);
+  const step = Math.max(1, Math.floor(pts.length / SPIN_FIT_COARSE_SAMPLES));
+  const cp = [], cd = [], ct = [];
+  for (let i = 0; i < pts.length; i += step) { cp.push(pts[i]); cd.push(dists[i]); ct.push(dts[i]); }
+
+  // Coarse sweep: 1 degree over both spin directions.
+  const coarse = [];
+  for (const omega of [speed, -speed]) {
+    for (let th = 0; th < 360; th += 1) {
+      coarse.push({ theta0: th, omega, rms: spinResidual(cp, cd, ct, segs, center, th, omega) });
+    }
+  }
+  coarse.sort((a, b) => a.rms - b.rms);
+  const top = coarse[0];
+
+  // Best candidate that is a genuinely different solution, not the same
+  // minimum sampled one degree over — this is the 90-degree alias margin.
+  const alias = coarse.find((c) => {
+    if (c.omega !== top.omega) return true;
+    const d = Math.abs(c.theta0 - top.theta0) % 360;
+    return Math.min(d, 360 - d) >= SPIN_FIT_ALIAS_SEPARATION;
+  });
+
+  // Refine on the full sample set: theta, then omega, then theta again.
+  let { theta0, omega } = top;
+  let rms = spinResidual(pts, dists, dts, segs, center, theta0, omega);
+  const sweep = (values, apply) => {
+    for (const v of values) {
+      const cand = apply(v);
+      const r = spinResidual(pts, dists, dts, segs, center, cand.theta0, cand.omega);
+      if (r < rms) { rms = r; theta0 = cand.theta0; omega = cand.omega; }
+    }
+  };
+  const range = (lo, hi, inc) => {
+    const out = [];
+    for (let v = lo; v <= hi + 1e-9; v += inc) out.push(v);
+    return out;
+  };
+  sweep(range(theta0 - 1, theta0 + 1, 0.05), (v) => ({ theta0: v, omega }));
+  sweep(range(omega - 0.5, omega + 0.5, 0.02), (v) => ({ theta0, omega: v }));
+  sweep(range(theta0 - 0.2, theta0 + 0.2, 0.01), (v) => ({ theta0: v, omega }));
+
+  const angles = new Array(worldPts.length);
+  for (let i = 0; i < worldPts.length; i++) angles[i] = theta0 + omega * (times[i] - t0);
+
+  const aliasRms = alias ? alias.rms : Infinity;
+  return {
+    angles,
+    theta0: ((theta0 % 360) + 360) % 360,
+    omega,
+    rms,
+    aliasRms,
+    // A real solution beats its aliases by two to three orders of magnitude.
+    confident: aliasRms > Math.max(rms * 5, 0.002),
+    n: pts.length,
+  };
 }
 
 // ---------------------------------------------------------------------------
