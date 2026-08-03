@@ -4,13 +4,18 @@ import {
   parseHandCsv, handLocal3D, participantFromFilename,
   parseTrackerCsv, trackerLocal3D, sessionFromFilename,
   parseCalibCsv, calibDerotate, sessionFromCalibFilename,
+  parseEllipseTrajCsv, parseEllipseSummaryCsv, sessionFromEllipseFilename,
+  ellipseDerotate, fitEllipseTrace, bestCircleFit, loggedLocalResidual,
+  predictedCircle, flatEllipse,
   loadReference, loadReference3D, partitionIntoCycles,
   DEFAULT_STIM_CENTER, DEFAULT_STIM_SCALE, DEFAULT_CUBE_WORLD_EDGE,
+  DEFAULT_DISK_DIAMETER,
 } from './csv.js'
 import { Viewer, REP_COLORS, ALL_COLORS } from './viewer.js'
 
 const BASE_URL = import.meta.env.BASE_URL
 const MIN_POINTS = 10
+const DEG = Math.PI / 180
 // Calibration stimulus parameters — must match Unity inspector values in
 // RotatingTraceExperimentManager (R2) and FourierTrefoil3D (calibAmplitude).
 const CALIB_R2 = 1.5
@@ -22,34 +27,66 @@ const DEFAULT_CONFIG = {
   cz: DEFAULT_STIM_CENTER.z,
   stimScale: DEFAULT_STIM_SCALE,
   cubeWorldEdge: DEFAULT_CUBE_WORLD_EDGE,
+  diskDiameter: DEFAULT_DISK_DIAMETER,
 }
 
 function hex(c) {
   return '#' + c.toString(16).padStart(6, '0')
 }
 
-// 'hand' | 'tracker' | 'calib' — falls back to null for unrecognised files.
+// 'hand' | 'tracker' | 'calib' | 'ellipse' | 'ellipse-summary' — falls back to
+// null for unrecognised files. The ellipse summary is a per-trial sidecar, not a
+// dataset of its own: it is merged into the trajectory trials.
 function datasetFromFilename(name) {
   if (/^RotatingTrace_Calib_/i.test(name)) return 'calib'
   if (/^RotatingTrace_/i.test(name)) return 'tracker'
+  if (/^EllipseCircle_Traj_/i.test(name)) return 'ellipse'
+  if (/^EllipseCircle_/i.test(name)) return 'ellipse-summary'
   if (/_Hand\.csv$/i.test(name)) return 'hand'
   return null
+}
+
+// Everything the ellipse view needs from one trial's raw samples. `summary` may
+// be missing — the trace still draws, but with no aspect ratio there is no
+// predicted circle and no depth scale, so those readouts are suppressed.
+function deriveEllipse(t, summary, center, diameterM) {
+  const radius = ((summary?.WorldDiameter || diameterM) || DEFAULT_DISK_DIAMETER) / 2
+  const local3D = ellipseDerotate(t.world, t.angles, center, radius)
+  const a = summary?.AspectRatio
+  const hasA = Number.isFinite(a) && a > 0
+  return {
+    ...t,
+    summary: summary ?? null,
+    radius,
+    local3D,
+    fit: fitEllipseTrace(local3D),
+    residual: loggedLocalResidual(local3D, t.logged, radius),
+    circleFit: hasA ? bestCircleFit(local3D, a) : null,
+    refFlat: hasA ? flatEllipse(a) : null,
+    refPos: hasA ? predictedCircle(a, 1) : null,
+    refNeg: hasA ? predictedCircle(a, -1) : null,
+  }
 }
 
 export default function App() {
   const plotRef = useRef(null)
   const viewerRef = useRef(null)
 
-  const [dataset, setDataset] = useState('hand') // 'hand' | 'tracker' | 'calib'
+  const [dataset, setDataset] = useState('hand') // 'hand' | 'tracker' | 'calib' | 'ellipse'
 
   // Per-dataset bundles + active key, kept separate so switching the toggle
   // doesn't lose either side's loaded data.
   const [handBundles, setHandBundles] = useState({})
   const [trackerBundles, setTrackerBundles] = useState({})
   const [calibBundles, setCalibBundles] = useState({})
+  const [ellipseBundles, setEllipseBundles] = useState({})
   const [handKey, setHandKey] = useState(null)
   const [trackerKey, setTrackerKey] = useState(null)
   const [calibKey, setCalibKey] = useState(null)
+  const [ellipseKey, setEllipseKey] = useState(null)
+  // Ellipse summary rows, session → Map(TrialIndex → row). Held separately so a
+  // summary file dropped before (or after) its trajectory file still lands.
+  const [ellipseSummaries, setEllipseSummaries] = useState({})
 
   // Scene config: trefoil/cube position + scale exposed for runtime tuning.
   const [stimConfig, setStimConfig] = useState(DEFAULT_CONFIG)
@@ -72,8 +109,11 @@ export default function App() {
   const [movieRefPts, setMovieRefPts] = useState(null)  // 2D reference (tracker only)
   const movieLastTsRef = useRef(null)
 
-  const bundles = dataset === 'hand' ? handBundles : dataset === 'tracker' ? trackerBundles : calibBundles
-  const activeKey = dataset === 'hand' ? handKey : dataset === 'tracker' ? trackerKey : calibKey
+  const bundlesByDataset = { hand: handBundles, tracker: trackerBundles, calib: calibBundles, ellipse: ellipseBundles }
+  const keyByDataset = { hand: handKey, tracker: trackerKey, calib: calibKey, ellipse: ellipseKey }
+  const setKeyByDataset = { hand: setHandKey, tracker: setTrackerKey, calib: setCalibKey, ellipse: setEllipseKey }
+  const bundles = bundlesByDataset[dataset]
+  const activeKey = keyByDataset[dataset]
   // For calib dataset, apply TrialType filter before passing to all rendering
   // paths. For hand/tracker datasets, returns the raw bundle unchanged.
   const trials = useMemo(() => {
@@ -109,8 +149,7 @@ export default function App() {
 
   // If we switch to a dataset that doesn't support the current mode, fall back.
   useEffect(() => {
-    if (dataset === 'tracker' && mode === 'condition') setMode('single')
-    if (dataset === 'calib' && mode === 'condition') setMode('single')
+    if (dataset !== 'hand' && mode === 'condition') setMode('single')
     if (dataset === 'hand' && mode === 'movie') setMode('single')
   }, [dataset, mode])
 
@@ -126,6 +165,37 @@ export default function App() {
     ;(async () => {
       v.clearAll()
       if (!trials.length) return
+
+      if (dataset === 'ellipse') {
+        // Reference per trial: the flat ellipse actually drawn (z=0) plus both
+        // tilt readings of it. The tilt the trace matches is drawn solid, the
+        // other faint — the percept is bistable, so both are legitimate.
+        const addRefs = (t) => {
+          if (!showRef || !t.refFlat) return
+          v.addReference(t.refFlat)
+          const chosen = t.circleFit?.sign ?? 1
+          v.addRef3D(chosen > 0 ? t.refPos : t.refNeg, { opacity: 0.6 })
+          v.addRef3D(chosen > 0 ? t.refNeg : t.refPos, { opacity: 0.15 })
+        }
+
+        if (mode === 'single') {
+          const t = trials[Math.min(singleIdx, trials.length - 1)]
+          if (!t) return
+          addRefs(t)
+          v.addTrace(t.local3D, REP_COLORS[t.TrialIndex % REP_COLORS.length], {
+            showDots: true, alpha: 1.0,
+          })
+        } else {
+          for (let i = 0; i < trials.length; i++) {
+            const t = trials[i]
+            addRefs(t)
+            v.addTrace(t.local3D, ALL_COLORS[i % ALL_COLORS.length], {
+              alpha: 0.55, showDots: true, dotSize: 0.03,
+            })
+          }
+        }
+        return
+      }
 
       if (dataset === 'calib') {
         if (mode === 'single') {
@@ -195,7 +265,7 @@ export default function App() {
   // Resize plot when the layout might have changed.
   useEffect(() => {
     viewerRef.current?.resize()
-  }, [handBundles, trackerBundles, calibBundles, dataset, handKey, trackerKey, calibKey])
+  }, [handBundles, trackerBundles, calibBundles, ellipseBundles, dataset, handKey, trackerKey, calibKey, ellipseKey])
 
   // --- Movie mode effects ---
 
@@ -217,9 +287,10 @@ export default function App() {
   }, [mode, trials, singleIdx])
 
   // (2) Preload the 2D reference curve for tracker movie mode (calib uses its
-  //     own per-frame nearestCurve, so no server load is needed there).
+  //     own per-frame nearestCurve and the ellipse computes its rim from the
+  //     aspect ratio, so no server load is needed for either).
   useEffect(() => {
-    if (mode !== 'movie' || !trials.length || !showRef || dataset === 'calib') {
+    if (mode !== 'movie' || !trials.length || !showRef || dataset !== 'tracker') {
       setMovieRefPts(null)
       return
     }
@@ -270,6 +341,13 @@ export default function App() {
     // Calib: curve or cube ground truth for this trial.
     if (frame.nearestCurve?.length && showRef) v.addRef3D(frame.nearestCurve)
     if (movieTrial?.cubeRef && showRef) v.addWireframeCube(movieTrial.cubeRef.center, movieTrial.cubeRef.halfEdge)
+    // Ellipse: flat ellipse + both tilts, fixed across frames.
+    if (movieTrial?.refFlat && showRef) {
+      v.addReference(movieTrial.refFlat)
+      const chosen = movieTrial.circleFit?.sign ?? 1
+      v.addRef3D(chosen > 0 ? movieTrial.refPos : movieTrial.refNeg, { opacity: 0.6 })
+      v.addRef3D(chosen > 0 ? movieTrial.refNeg : movieTrial.refPos, { opacity: 0.15 })
+    }
 
     const color = frame.isPartial ? 0x888888 : REP_COLORS[idx % REP_COLORS.length]
     v.addTrace(frame.local3D, color, { showDots: true, alpha: 1.0 })
@@ -309,6 +387,18 @@ export default function App() {
       return next
     })
 
+    // The ellipse frame is in radius units, so it re-derives from the disk
+    // diameter rather than the trefoil scale. A summary row's WorldDiameter
+    // still wins over the config value (see deriveEllipse).
+    setEllipseBundles((prev) => {
+      if (!Object.keys(prev).length) return prev
+      const next = {}
+      for (const [key, rows] of Object.entries(prev)) {
+        next[key] = rows.map((t) => deriveEllipse(t, t.summary, center, cfg.diskDiameter))
+      }
+      return next
+    })
+
     setStimConfig(cfg)
   }, [])
 
@@ -322,18 +412,63 @@ export default function App() {
     const nextHand = { ...handBundles }
     const nextTracker = { ...trackerBundles }
     const nextCalib = { ...calibBundles }
+    const nextEllipse = { ...ellipseBundles }
+    const nextSummaries = { ...ellipseSummaries }
     let firstNewHand = null
     let firstNewTracker = null
     let firstNewCalib = null
+    let firstNewEllipse = null
     const errors = []
     const cfgCenter = { x: stimConfig.cx, y: stimConfig.cy, z: stimConfig.cz }
     const cfgScale = stimConfig.stimScale
     const cfgHalfEdge = (stimConfig.cubeWorldEdge / 2) / stimConfig.stimScale
+
+    // Ellipse summaries first: a trajectory file parsed in the same drop needs
+    // its aspect ratio, which only the summary carries.
+    for (const f of csvFiles) {
+      if (datasetFromFilename(f.name) !== 'ellipse-summary') continue
+      try {
+        const id = sessionFromEllipseFilename(f.name)
+        const map = parseEllipseSummaryCsv(await f.text())
+        if (!map.size) {
+          errors.push(`${f.name}: 0 summary rows parsed`)
+          continue
+        }
+        nextSummaries[id] = map
+        // Attach to a trajectory bundle already loaded for this session.
+        if (nextEllipse[id]) {
+          nextEllipse[id] = nextEllipse[id].map((t) =>
+            deriveEllipse(t, map.get(t.TrialIndex), cfgCenter, stimConfig.diskDiameter))
+          firstNewEllipse ??= id
+        }
+      } catch (e) {
+        errors.push(`${f.name}: ${e.message ?? e}`)
+      }
+    }
+
     for (const f of csvFiles) {
       const kind = datasetFromFilename(f.name) ?? dataset
+      if (kind === 'ellipse-summary') continue
       try {
         const text = await f.text()
-        if (kind === 'calib') {
+        if (kind === 'ellipse') {
+          const rows = parseEllipseTrajCsv(text).filter((t) => t.world.length >= MIN_POINTS)
+          if (!rows.length) {
+            errors.push(`${f.name}: 0 trials with ≥${MIN_POINTS} points`)
+            continue
+          }
+          const id = sessionFromEllipseFilename(f.name)
+          const summaries = nextSummaries[id]
+          nextEllipse[id] = rows.map((t) =>
+            deriveEllipse(t, summaries?.get(t.TrialIndex), cfgCenter, stimConfig.diskDiameter))
+          if (!summaries) {
+            errors.push(
+              `${f.name}: no EllipseCircle_${id}.csv alongside it — traces will draw, ` +
+              `but the aspect ratio lives in the summary file, so there is no ` +
+              `reference circle and no depth scale.`)
+          }
+          firstNewEllipse = id
+        } else if (kind === 'calib') {
           const rows = parseCalibCsv(text).filter((t) => t.world.length >= MIN_POINTS)
           if (!rows.length) {
             errors.push(`${f.name}: 0 trials with ≥${MIN_POINTS} points`)
@@ -391,8 +526,15 @@ export default function App() {
     setHandBundles(nextHand)
     setTrackerBundles(nextTracker)
     setCalibBundles(nextCalib)
+    setEllipseBundles(nextEllipse)
+    setEllipseSummaries(nextSummaries)
     // Switch to the most-specific newly loaded dataset.
-    if (firstNewCalib) {
+    if (firstNewEllipse) {
+      setEllipseKey(firstNewEllipse)
+      setDataset('ellipse')
+      setSingleIdx(0)
+      if (mode === 'condition') setMode('single')
+    } else if (firstNewCalib) {
       setCalibKey(firstNewCalib)
       setDataset('calib')
       setSingleIdx(0)
@@ -408,7 +550,7 @@ export default function App() {
       setSingleIdx(0)
     }
     if (errors.length) setParseErr(errors.join('\n'))
-  }, [handBundles, trackerBundles, calibBundles, dataset, mode, stimConfig])
+  }, [handBundles, trackerBundles, calibBundles, ellipseBundles, ellipseSummaries, dataset, mode, stimConfig])
 
   const onDrop = useCallback(
     (e) => {
@@ -455,6 +597,96 @@ export default function App() {
   // Info panel content.
   const info = (() => {
     if (!trials.length) return ''
+
+    if (dataset === 'ellipse') {
+      const t = trials[Math.min(singleIdx, trials.length - 1)]
+
+      // Per-trial block, shared by single and movie modes. Lengths are printed
+      // in metres (the frame itself is in radius units).
+      const trialLines = (t) => {
+        if (!t) return ''
+        const s = t.summary
+        const r = t.radius
+        const depthM = t.fit ? t.fit.depth * r : NaN
+        let head = `Trial ${t.TrialIndex}`
+        let pred = ''
+        if (s && t.fit) {
+          const dir = s.Direction > 0 ? 'CCW' : 'CW'
+          head += ` · cfg ${s.ConfigId} · rep ${s.RepetitionNumber}\n` +
+                  `a=${s.AspectRatio.toFixed(2)}  σ=${s.ImpliedSlantDeg.toFixed(1)}°  ` +
+                  `D=${s.WorldDiameter.toFixed(3)}m  ${s.RotationSpeed.toFixed(0)}°/s ${dir}`
+          const k = s.PredictedDepth > 0 ? depthM / s.PredictedDepth : NaN
+          const kSlant = s.ImpliedSlantDeg > 0
+            ? Math.tan(DEG * t.fit.slantDeg) / Math.tan(DEG * s.ImpliedSlantDeg)
+            : NaN
+          pred = `\ndepth: ${(depthM * 100).toFixed(1)}cm vs predicted ` +
+                 `${(s.PredictedDepth * 100).toFixed(1)}cm   k=${k.toFixed(2)}` +
+                 `\nslant: ${t.fit.slantDeg.toFixed(1)}° vs ${s.ImpliedSlantDeg.toFixed(1)}°   ` +
+                 `k(slant)=${kSlant.toFixed(2)}`
+          if (Number.isFinite(s.TracedDepthZ)) {
+            const dDepth = Math.abs(s.TracedDepthZ - depthM) * 1000
+            const dSlant = Math.abs(s.FitSlantDeg - t.fit.slantDeg)
+            pred += `\nvs Unity's own fit: Δdepth ${dDepth.toFixed(1)}mm  Δslant ${dSlant.toFixed(2)}°`
+          }
+        } else {
+          head += '\n(no summary file — aspect ratio unknown)'
+        }
+        const ext = t.fit
+          ? `\nextent: x=${(t.fit.extent.x * r * 100).toFixed(1)} ` +
+            `y=${(t.fit.extent.y * r * 100).toFixed(1)} ` +
+            `z=${(t.fit.extent.z * r * 100).toFixed(1)} cm` +
+            `\ncentroid off-center: ${(Math.hypot(t.fit.centroid.x, t.fit.centroid.y, t.fit.centroid.z) * r * 100).toFixed(1)}cm`
+          : ''
+        const cf = t.circleFit
+          ? `\nfit to predicted circle: mean ${(t.circleFit.mean * r * 100).toFixed(1)}cm ` +
+            `(tilt ${t.circleFit.sign > 0 ? '+' : '−'}, other tilt ${(t.circleFit.other * r * 100).toFixed(1)}cm)`
+          : ''
+        // A near-even tilt split means the percept flipped mid-trial: the slant
+        // fit averages the two readings to ~0, though the depth extent survives.
+        const flip = t.fit && t.fit.tiltShare < 0.8
+          ? `\n⚠ tilt splits ${(t.fit.tiltShare * 100).toFixed(0)}/${((1 - t.fit.tiltShare) * 100).toFixed(0)} — ` +
+            `percept flipped within the trial, so the slant fit cancels out (depth extent still holds)`
+          : ''
+        const res = t.residual != null && t.residual > 0.001
+          ? `\n⚠ logged Local column differs by up to ${(t.residual * 1000).toFixed(0)}mm — check disk center/diameter`
+          : ''
+        return head + pred + ext + cf + flip + res + `\nsamples: ${t.world.length}`
+      }
+
+      if (mode === 'movie') {
+        if (!movieResult?.frames.length) return 'Computing cycles…'
+        const numFrames = movieResult.frames.length
+        const idx = ((movieFrameIdx % numFrames) + numFrames) % numFrames
+        const frame = movieResult.frames[idx]
+        const f0 = frame.times[0]?.toFixed(2) ?? '?'
+        const f1 = frame.times[frame.times.length - 1]?.toFixed(2) ?? '?'
+        const fit = fitEllipseTrace(frame.local3D)
+        const revDepth = fit ? (fit.depth * t.radius * 100).toFixed(1) : '—'
+        // Frames are disk revolutions, not hand traversals — the participant
+        // usually laps the rim faster than the disk turns.
+        return (
+          `Disk rev ${idx + 1} / ${numFrames}${frame.isPartial ? ' (partial — grey)' : ''}\n` +
+          `angle span: ${frame.angleRange.toFixed(0)}°  samples: ${frame.local3D.length}\n` +
+          `time: [${f0}s, ${f1}s]  depth this rev: ${revDepth}cm  ` +
+          `slant: ${fit ? fit.slantDeg.toFixed(1) : '—'}°\n` +
+          trialLines(t)
+        )
+      }
+      if (mode === 'single') return trialLines(t)
+
+      const withSummary = trials.filter((x) => x.summary && x.fit)
+      if (!withSummary.length) return `All ${trials.length} trials overlaid (no summary file)`
+      const ks = withSummary
+        .map((x) => (x.summary.PredictedDepth > 0 ? (x.fit.depth * x.radius) / x.summary.PredictedDepth : NaN))
+        .filter(Number.isFinite)
+      const meanK = ks.reduce((s, v) => s + v, 0) / ks.length
+      const as = [...new Set(withSummary.map((x) => x.summary.AspectRatio.toFixed(2)))].sort()
+      return (
+        `All ${trials.length} trials overlaid\n` +
+        `aspect ratios: ${as.join(', ')}\n` +
+        `mean depth scale k = ${meanK.toFixed(2)} over ${ks.length} trials`
+      )
+    }
 
     if (dataset === 'calib') {
       if (mode === 'movie') {
@@ -573,6 +805,68 @@ export default function App() {
   // Legend rows.
   const legend = (() => {
     if (!trials.length) return null
+
+    if (dataset === 'ellipse') {
+      const t = trials[Math.min(singleIdx, trials.length - 1)]
+      const refRows = showRef && t?.refFlat && (
+        <>
+          <div>
+            <span className="sw" style={{ background: '#70e0c0' }} />
+            predicted circle (tilt {t.circleFit?.sign > 0 ? '+' : '−'})
+          </div>
+          <div>
+            <span className="sw" style={{ background: '#70e0c0', opacity: 0.3 }} />
+            mirror tilt (the other percept)
+          </div>
+          <div>
+            <span className="sw" style={{ background: '#a0b4dc' }} />
+            flat ellipse on screen (z=0)
+          </div>
+        </>
+      )
+
+      if (mode === 'movie') {
+        if (!movieResult?.frames.length) return null
+        const numFrames = movieResult.frames.length
+        const idx = ((movieFrameIdx % numFrames) + numFrames) % numFrames
+        const frame = movieResult.frames[idx]
+        const color = frame.isPartial ? 0x888888 : REP_COLORS[idx % REP_COLORS.length]
+        return (
+          <>
+            <div>
+              <span className="sw" style={{ background: hex(color) }} />
+              disk rev {idx + 1}/{numFrames}{frame.isPartial ? ' (partial)' : ''}
+            </div>
+            {refRows}
+            <div style={{ color: '#5a6070', marginTop: 4 }}>grey = partial revolution</div>
+          </>
+        )
+      }
+      if (mode === 'single') {
+        if (!t) return null
+        return (
+          <>
+            <div>
+              <span className="sw" style={{ background: hex(REP_COLORS[t.TrialIndex % REP_COLORS.length]) }} />
+              trace (trial {t.TrialIndex})
+            </div>
+            {refRows}
+          </>
+        )
+      }
+      return (
+        <>
+          <div style={{ color: '#8891a3' }}>all {trials.length} trials</div>
+          {trials.map((x, i) => (
+            <div key={x.TrialIndex}>
+              <span className="sw" style={{ background: hex(ALL_COLORS[i % ALL_COLORS.length]) }} />
+              trial {x.TrialIndex}
+              {x.summary ? ` (a=${x.summary.AspectRatio.toFixed(2)})` : ''}
+            </div>
+          ))}
+        </>
+      )
+    }
 
     if (dataset === 'calib') {
       if (mode === 'movie') {
@@ -730,15 +1024,22 @@ export default function App() {
     )
   })()
 
-  const datasetLabel = dataset === 'hand' ? 'Participant' : dataset === 'calib' ? 'Calib session' : 'Session'
+  const datasetLabel = dataset === 'hand' ? 'Participant'
+    : dataset === 'calib' ? 'Calib session'
+    : dataset === 'ellipse' ? 'Ellipse session'
+    : 'Session'
   const dropHint = dataset === 'hand'
     ? <>or drop <code>*_Hand.csv</code> files anywhere</>
     : dataset === 'calib'
     ? <>or drop <code>RotatingTrace_Calib_*.csv</code> files anywhere</>
+    : dataset === 'ellipse'
+    ? <>or drop <code>EllipseCircle_Traj_*.csv</code> + <code>EllipseCircle_*.csv</code> together</>
     : <>or drop <code>RotatingTrace_*.csv</code> files anywhere</>
-  const setActiveKey = dataset === 'hand' ? setHandKey : dataset === 'tracker' ? setTrackerKey : setCalibKey
+  const setActiveKey = setKeyByDataset[dataset]
 
-  const refLabel = dataset === 'calib' ? 'ground-truth curve' : '2D outline at z=0'
+  const refLabel = dataset === 'calib' ? 'ground-truth curve'
+    : dataset === 'ellipse' ? 'predicted circle + flat ellipse'
+    : '2D outline at z=0'
   const modesForDataset = dataset === 'hand'
     ? ['single', 'condition', 'all']
     : ['single', 'all', 'movie']
@@ -758,6 +1059,7 @@ export default function App() {
             ['hand', 'Hand Tracking'],
             ['tracker', 'Rotating Trace'],
             ['calib', 'Calibration'],
+            ['ellipse', 'Ellipse–Circle'],
           ].map(([k, label]) => (
             <button
               key={k}
@@ -829,7 +1131,7 @@ export default function App() {
           </>
         )}
 
-        {mode === 'movie' && (dataset === 'tracker' || dataset === 'calib') && (
+        {mode === 'movie' && dataset !== 'hand' && (
           <>
             <h3>Percept Movie</h3>
             {movieResult && movieResult.frames.length > 0 ? (
@@ -986,6 +1288,15 @@ export default function App() {
               onChange={(e) => setDraftConfig((c) => ({ ...c, cubeWorldEdge: +e.target.value }))}
             />
           </div>
+          <div className="cfg-row">
+            <label>disk Ø (m)</label>
+            <input
+              type="number"
+              step="0.01"
+              value={draftConfig.diskDiameter}
+              onChange={(e) => setDraftConfig((c) => ({ ...c, diskDiameter: +e.target.value }))}
+            />
+          </div>
         </div>
         <div className="row">
           <button style={{ flex: 1 }} onClick={() => applyStimConfig(draftConfig)}>Apply</button>
@@ -1023,6 +1334,7 @@ export default function App() {
             drop one or more{' '}
             {dataset === 'hand' ? <code>*_Hand.csv</code>
               : dataset === 'calib' ? <code>RotatingTrace_Calib_*.csv</code>
+              : dataset === 'ellipse' ? <code>EllipseCircle_*.csv</code>
               : <code>RotatingTrace_*.csv</code>}{' '}
             files here
           </div>

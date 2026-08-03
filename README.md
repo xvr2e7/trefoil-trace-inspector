@@ -1,9 +1,11 @@
 # Trefoil Trace Inspector
 
-Browser-only 3D viewer for two trefoil-tracing experiments:
+Browser-only 3D viewer for the tracing experiments:
 
 - **Hand Tracking** — Unity pilot study (`*_Hand.csv`).
 - **Rotating Trace** — SteamVR fingertip-tracker task (`RotatingTrace_*.csv`).
+- **Calibration** — the cube and trefoil blocks of that task (`RotatingTrace_Calib_*.csv`).
+- **Ellipse–Circle** — depth-scale control (`EllipseCircle_Traj_*.csv` + `EllipseCircle_*.csv`).
 
 Drop files onto the page (or use the file picker); everything is parsed and
 rendered client-side. The left-panel **Dataset** toggle switches between the
@@ -43,6 +45,29 @@ p_local[i] = R_z(-TrefoilAngleDeg[i]) · (p_world[i] - stim_center) / 0.1
 
 with `stim_center = (0, 1.0, 0.4)`. Stimulus parameters (R1, R2, speed,
 direction) are assumed constant across trials in a file.
+
+**Ellipse–Circle (`EllipseCircle_Traj_*.csv` + `EllipseCircle_*.csv`).** Drop
+both files of a session together: the trajectory file holds the samples, but the
+aspect ratio lives in the summary, and without it there is no reference circle
+and no depth scale. Samples are de-rotated by their own `DiskAngleDeg` into the
+disk's frame, in units of the disk's major radius (so a veridically traced
+circle has radius 1):
+
+```
+p_local[i] = R_z(-DiskAngleDeg[i]) · (p_world[i] - disk_center) / (WorldDiameter/2)
+```
+
+with `disk_center = (0, 1.0, 0.65)`. The disk's own rotation is assumed identity
+in the scene — rotating the disk object in Unity would break this.
+
+The view draws the flat ellipse actually on screen (z=0) plus **both** tilt
+readings of it, the one the trace matches solid and the mirror faint, since the
+percept is bistable. Per trial it reports the traced depth against the isotropic
+prediction (`k`), the fitted slant against the implied slant (`k(slant)`), the
+distance to the predicted circle, and — when the two tilt arms come out even —
+a warning that the percept flipped mid-trial, which is what drives a fitted
+slant of ~0° with the depth extent intact. Movie mode steps through disk
+revolutions, not hand traversals.
 
 ## Develop
 

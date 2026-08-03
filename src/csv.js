@@ -293,6 +293,277 @@ export function sessionFromCalibFilename(name) {
 }
 
 // ---------------------------------------------------------------------------
+// Ellipse–Circle control files (`EllipseCircle_Traj_*.csv` + `EllipseCircle_*.csv`).
+// ---------------------------------------------------------------------------
+// The control task spins a flat ellipse about the line of sight; the participant
+// traces the rim of the circle they see tilted in depth. Two files per session:
+//
+//   EllipseCircle_Traj_*.csv  one row per sample — world path, the disk's spin
+//                             angle at that sample, and the de-rotated copy
+//                             Unity wrote (Local{X,Y,Z}, metres).
+//   EllipseCircle_*.csv       one row per trial — aspect ratio, predicted depth,
+//                             Unity's own fit. Needed for the reference circle
+//                             and the depth scale k: the trajectory file alone
+//                             does not carry the aspect ratio.
+//
+// The two are merged on (session, TrialIndex).
+
+// Disk transform, from EllipseCircle.unity: EllipseDisk sits at (0, 1, 0.65) with
+// identity rotation and uniform scale 0.4, so its local diameter of 1.0 is 0.4 m
+// in the world.
+export const DEFAULT_DISK_CENTER = { x: 0, y: 1.0, z: 0.65 }
+export const DEFAULT_DISK_DIAMETER = 0.4
+
+export function parseEllipseTrajCsv(text) {
+  const lines = text.split(/\r?\n/).filter((l) => l.length > 0)
+  if (lines.length < 2) return []
+  const header = lines[0].split(",").map((h) => h.trim())
+  const col = Object.fromEntries(header.map((h, i) => [h, i]))
+  const required = [
+    "TrialIndex", "PointIndex", "WorldX", "WorldY", "WorldZ",
+    "DiskAngleDeg", "TimeStamp",
+  ]
+  for (const k of required) {
+    if (!(k in col)) throw new Error(`missing column: ${k}`)
+  }
+  // Pre-2026-07-31 files logged world samples only, with no spin angle — those
+  // traces cannot be de-rotated, and the missing column is caught above.
+  const hasLogged = "LocalX" in col && "LocalY" in col && "LocalZ" in col
+
+  const trials = new Map()
+  for (let i = 1; i < lines.length; i++) {
+    const f = lines[i].split(",")
+    if (f.length < header.length) continue
+    const tid = +f[col.TrialIndex]
+    let t = trials.get(tid)
+    if (!t) {
+      t = {
+        TrialIndex: tid,
+        world: [],
+        angles: [],
+        times: [],
+        logged: hasLogged ? [] : null,
+      }
+      trials.set(tid, t)
+    }
+    t.world.push({ x: +f[col.WorldX], y: +f[col.WorldY], z: +f[col.WorldZ] })
+    t.angles.push(+f[col.DiskAngleDeg])
+    t.times.push(+f[col.TimeStamp])
+    if (hasLogged) {
+      t.logged.push({ x: +f[col.LocalX], y: +f[col.LocalY], z: +f[col.LocalZ] })
+    }
+  }
+  return [...trials.values()].sort((a, b) => a.TrialIndex - b.TrialIndex)
+}
+
+// One row per trial → Map(TrialIndex → row). Unity's own fit is kept so the
+// inspector's recomputation can be checked against it.
+export function parseEllipseSummaryCsv(text) {
+  const lines = text.split(/\r?\n/).filter((l) => l.length > 0)
+  if (lines.length < 2) return new Map()
+  const header = lines[0].split(",").map((h) => h.trim())
+  const col = Object.fromEntries(header.map((h, i) => [h, i]))
+  for (const k of ["TrialIndex", "AspectRatio", "WorldDiameter", "PredictedDepth"]) {
+    if (!(k in col)) throw new Error(`missing column: ${k}`)
+  }
+  const num = (f, k) => (k in col ? +f[col[k]] : NaN)
+
+  const out = new Map()
+  for (let i = 1; i < lines.length; i++) {
+    const f = lines[i].split(",")
+    if (f.length < header.length) continue
+    out.set(+f[col.TrialIndex], {
+      TrialIndex: +f[col.TrialIndex],
+      ConfigId: num(f, "ConfigId"),
+      RepetitionNumber: num(f, "RepetitionNumber"),
+      AspectRatio: num(f, "AspectRatio"),
+      ImpliedSlantDeg: num(f, "ImpliedSlantDeg"),
+      WorldDiameter: num(f, "WorldDiameter"),
+      PredictedDepth: num(f, "PredictedDepth"),
+      RotationSpeed: num(f, "RotationSpeed"),
+      Direction: num(f, "Direction"),
+      TraceDuration: num(f, "TraceDuration"),
+      NumTracePoints: num(f, "NumTracePoints"),
+      // Unity's fit, in the disk frame (metres / degrees).
+      TracedDepthZ: num(f, "TracedDepthZ"),
+      FitSlantDeg: num(f, "FitSlantDeg"),
+      MeasuredFrameRateHz: num(f, "MeasuredFrameRateHz"),
+    })
+  }
+  return out
+}
+
+// World → disk frame, in units of the disk's major RADIUS, so a veridically
+// traced circle has radius 1 and the viewer's default framing fits it:
+//   p_local[i] = R_z(-DiskAngleDeg[i]) · (p_world[i] - center) / radius
+//
+// Same rotation convention as trackerLocal3D — both Unity stimuli spin with
+// `transform.localRotation = Quaternion.Euler(0, 0, angle)`. The disk's un-spun
+// rotation Q0 is dropped because it is identity in EllipseCircle.unity; rotating
+// the disk object in the scene would invalidate this.
+export function ellipseDerotate(
+  worldPts, anglesDeg,
+  center = DEFAULT_DISK_CENTER,
+  radius = DEFAULT_DISK_DIAMETER / 2,
+) {
+  const out = new Array(worldPts.length)
+  for (let i = 0; i < worldPts.length; i++) {
+    const a = -THREE.MathUtils.degToRad(anglesDeg[i])
+    const ca = Math.cos(a)
+    const sa = Math.sin(a)
+    const px = (worldPts[i].x - center.x) / radius
+    const py = (worldPts[i].y - center.y) / radius
+    const pz = (worldPts[i].z - center.z) / radius
+    out[i] = { x: ca * px - sa * py, y: sa * px + ca * py, z: pz }
+  }
+  return out
+}
+
+// Per-trial fit of a de-rotated rim trace. Lengths in radius units; multiply by
+// `radius` for metres. The slant fit is centroid-relative, matching
+// EllipseCircleExperimentManager.FitSlantDeg, so the two are comparable.
+export function fitEllipseTrace(local3D) {
+  const n = local3D.length
+  if (!n) return null
+
+  let cx = 0, cy = 0, cz = 0
+  let minX = Infinity, minY = Infinity, minZ = Infinity
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity
+  for (const p of local3D) {
+    cx += p.x; cy += p.y; cz += p.z
+    if (p.x < minX) minX = p.x
+    if (p.y < minY) minY = p.y
+    if (p.z < minZ) minZ = p.z
+    if (p.x > maxX) maxX = p.x
+    if (p.y > maxY) maxY = p.y
+    if (p.z > maxZ) maxZ = p.z
+  }
+  cx /= n; cy /= n; cz /= n
+
+  // z = tan(sigma)·y about the centroid.
+  let syy = 0, syz = 0
+  for (const p of local3D) {
+    const dy = p.y - cy
+    const dz = p.z - cz
+    syy += dy * dy
+    syz += dy * dz
+  }
+  const slope = syy > 1e-12 ? syz / syy : 0
+  const slantDeg = THREE.MathUtils.radToDeg(Math.atan(Math.abs(slope)))
+
+  // How one-sided the tilt is. Each sample contributes |dy·dz| to the arm whose
+  // sign it carries; a rim traced at one steady tilt puts nearly everything on
+  // one arm, so the share sits near 1. If the percept flips mid-trial the two
+  // arms even out toward 0.5 and the least-squares slant cancels to ~0 — which
+  // would otherwise read as "saw no depth" rather than "saw both tilts".
+  let wPos = 0, wNeg = 0
+  for (const p of local3D) {
+    const w = (p.y - cy) * (p.z - cz)
+    if (w >= 0) wPos += w
+    else wNeg -= w
+  }
+  const wTotal = wPos + wNeg
+  const tiltShare = wTotal > 1e-12 ? Math.max(wPos, wNeg) / wTotal : 1
+
+  return {
+    tiltShare,
+    centroid: { x: cx, y: cy, z: cz },
+    extent: { x: maxX - minX, y: maxY - minY, z: maxZ - minZ },
+    depth: maxZ - minZ,
+    slope,
+    slantDeg,
+    // Sign of the tilt the participant reported: which way the rim leans in
+    // depth. A mid-trial percept flip shows up as a slope near zero.
+    tiltSign: slope >= 0 ? 1 : -1,
+  }
+}
+
+// Predicted rim for aspect ratio a: the circle whose projection is the drawn
+// ellipse, tilted about the major (x) axis. Radius units, so the major axis is 1.
+//   c(t) = (cos t, a·sin t, s·sqrt(1-a^2)·sin t),   s = ±1 (bistable)
+// s = +1 and s = -1 are both valid percepts of the same image.
+export function predictedCircle(aspectRatio, sign = 1, segments = 180) {
+  const a = Math.min(Math.max(aspectRatio, 0), 1)
+  const depthAmp = sign * Math.sqrt(Math.max(0, 1 - a * a))
+  const pts = new Array(segments + 1)
+  for (let i = 0; i <= segments; i++) {
+    const t = (i / segments) * Math.PI * 2
+    const ct = Math.cos(t)
+    const st = Math.sin(t)
+    pts[i] = { x: ct, y: a * st, z: depthAmp * st }
+  }
+  return pts
+}
+
+// The flat ellipse actually drawn on the display (the retinal projection).
+export function flatEllipse(aspectRatio, segments = 180) {
+  return predictedCircle(aspectRatio, 0, segments)
+}
+
+// Distance from each sample to the predicted circle, for one tilt sign.
+//
+// The circle's plane is spanned by the orthonormal pair u = (1,0,0) and
+// v = (0, a, s·sqrt(1-a^2)) — unit because a^2 + (1-a^2) = 1 — with normal
+// n = u × v. In that basis the rim is the unit circle, so a point at radius r
+// and out-of-plane height h is hypot(r-1, h) away from it.
+//
+// The circle is centered on the local-frame ORIGIN, which is the disk's own
+// center, NOT the centroid of the trace being judged. (Centering a reference on
+// the trace is the bug that made the cube overlay drift; see git history.)
+export function circleFitError(local3D, aspectRatio, sign) {
+  const a = Math.min(Math.max(aspectRatio, 0), 1)
+  const d = Math.sqrt(Math.max(0, 1 - a * a))
+  const vy = a, vz = sign * d
+  const ny = -sign * d, nz = a
+
+  let sum = 0
+  let max = 0
+  for (const p of local3D) {
+    const pu = p.x
+    const pv = p.y * vy + p.z * vz
+    const h = p.y * ny + p.z * nz
+    const r = Math.hypot(pu, pv)
+    const dist = Math.hypot(r - 1, h)
+    sum += dist
+    if (dist > max) max = dist
+  }
+  return { mean: sum / local3D.length, max }
+}
+
+// Pick the tilt the trace actually matches, and report how well.
+export function bestCircleFit(local3D, aspectRatio) {
+  if (!local3D.length) return null
+  const pos = circleFitError(local3D, aspectRatio, 1)
+  const neg = circleFitError(local3D, aspectRatio, -1)
+  return pos.mean <= neg.mean
+    ? { sign: 1, ...pos, other: neg.mean }
+    : { sign: -1, ...neg, other: pos.mean }
+}
+
+// Largest gap between the de-rotated points the inspector computes and the ones
+// Unity logged. Non-zero means the assumed disk center/diameter differs from the
+// scene's, so the whole local frame is off.
+export function loggedLocalResidual(local3D, logged, radius) {
+  if (!logged?.length) return null
+  let max = 0
+  const n = Math.min(local3D.length, logged.length)
+  for (let i = 0; i < n; i++) {
+    const dx = local3D[i].x * radius - logged[i].x
+    const dy = local3D[i].y * radius - logged[i].y
+    const dz = local3D[i].z * radius - logged[i].z
+    const d = Math.hypot(dx, dy, dz)
+    if (d > max) max = d
+  }
+  return max
+}
+
+// "EllipseCircle_Traj_20260731_120000.csv" → "20260731_120000".
+export function sessionFromEllipseFilename(name) {
+  const base = name.replace(/\.csv$/i, "")
+  return base.replace(/^EllipseCircle_(Traj_)?/i, "") || base
+}
+
+// ---------------------------------------------------------------------------
 // Movie-mode: cycle partitioning.
 // ---------------------------------------------------------------------------
 

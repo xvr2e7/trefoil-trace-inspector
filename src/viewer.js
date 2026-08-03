@@ -159,9 +159,11 @@ export class Viewer {
     this.refGroup.add(new THREE.Line(g, mat))
   }
 
-  // 3D reference curve (calib nearest-curve ground truth). Unlike addReference
-  // this preserves the actual z values rather than forcing z=0.
-  addRef3D(points) {
+  // 3D reference curve (calib nearest-curve ground truth, ellipse predicted rim).
+  // Unlike addReference this preserves the actual z values rather than forcing z=0.
+  // opts.color / opts.opacity distinguish several curves in one scene — the
+  // ellipse view draws both tilt interpretations, the unchosen one dimmed.
+  addRef3D(points, opts = {}) {
     const g = new THREE.BufferGeometry()
     const arr = new Float32Array(points.length * 3)
     for (let i = 0; i < points.length; i++) {
@@ -171,9 +173,9 @@ export class Viewer {
     }
     g.setAttribute('position', new THREE.BufferAttribute(arr, 3))
     const mat = new THREE.LineBasicMaterial({
-      color: 0x70e0c0,
+      color: opts.color ?? 0x70e0c0,
       transparent: true,
-      opacity: 0.55,
+      opacity: opts.opacity ?? 0.55,
       depthWrite: false,
     })
     this.refGroup.add(new THREE.Line(g, mat))
