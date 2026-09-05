@@ -869,8 +869,8 @@ export async function loadReference(R2, baseUrl) {
 
 // 3D reference curve (z from coords CSV * amplitude) — used for trefoil3d_* calib types.
 // The coords CSV was generated with the same R1/R2 as the calibration model, but the
-// calib 3D model sits 90° clockwise (about Z, front view) of the CSV's orientation,
-// so x/y are rotated here: (x, y) → (y, -x).
+// calib 3D model sits 90° about Y of the CSV's orientation,
+// so x/z are rotated here: (x, z*amplitude) → (z*amplitude, -x).
 const ref3DCache = {};
 export async function loadReference3D(R2, amplitude, baseUrl) {
   const key = `${R2.toFixed(1)}_${amplitude.toFixed(3)}`;
@@ -885,7 +885,8 @@ export async function loadReference3D(R2, amplitude, baseUrl) {
     .slice(1)
     .map((l) => {
       const [, x, y, z] = l.split(",").map(Number);
-      return { x: y, y: -x, z: z * amplitude };
+      const zAmp = z * amplitude;
+      return { x: zAmp, y, z: -x };
     });
   pts.push({ ...pts[0] });
   ref3DCache[key] = pts;
