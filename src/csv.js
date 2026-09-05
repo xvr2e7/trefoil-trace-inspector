@@ -147,7 +147,7 @@ export function parseTrackerCsv(text) {
   return [...trials.values()].sort((a, b) => a.TrialIndex - b.TrialIndex);
 }
 
-// Trefoil stimulus: center (0, 1, 0.65), scale 0.08 — matches Unity scene.
+// Trefoil stimulus: center (0, 1, 0.5), scale 0.08 — matches Unity scene.
 //
 // De-rotation for RotatingTrace: the trefoil rotates around Z.
 //   p_local[i] = R_z(-TrefoilAngleDeg[i]) · (p_world[i] - STIM_CENTER) / STIM_SCALE
@@ -155,7 +155,7 @@ export function parseTrackerCsv(text) {
 // Undoing the Z-rotation per sample places every point in a frame where the
 // trefoil is stationary. The Z component carries the depth the participant
 // reported for that position on the curve.
-export const DEFAULT_STIM_CENTER = { x: 0, y: 1.0, z: 0.65 }
+export const DEFAULT_STIM_CENTER = { x: 0, y: 1.0, z: 0.5 }
 export const DEFAULT_STIM_SCALE = 0.08
 // World-space edge length = CubeCalibrator.edgeLength × cube transform scale.
 // Default: edgeLength 0.3 × transformScale 0.8 = 0.24 m.
